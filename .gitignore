@@ -1,0 +1,6 @@
+# Training/runtime logs
+logs/
+
+# Python cache files
+__pycache__/
+*.pyc

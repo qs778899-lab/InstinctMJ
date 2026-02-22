@@ -172,20 +172,14 @@ class PerceptiveShadowingSceneCfg(InteractiveSceneCfg):
                     proportion=1.0,
                     path="PLACEHOLDER",  # Will be overridden in concrete env cfg __post_init__
                     metadata_yaml="PLACEHOLDER",  # Will be overridden in concrete env cfg __post_init__
-                    # Use CoACD convex decomposition for concave / 3D-scanned STL terrains.
-                    # MuJoCo's polyhedral mesh collision treats the interior of a closed mesh
-                    # as solid, causing spurious contacts when the robot is inside a scanned room.
-                    # CoACD decomposes the mesh into approximate convex hulls so that only the
-                    # actual surface participates in collision.
-                    collision_coacd=True,
-                    # Keep to stable CoACD defaults and align collision top surface to visual mesh.
-                    collision_coacd_log_level="off",
-                    collision_coacd_use_disk_cache=True,
-                    collision_coacd_prewarm_all=True,
-                    collision_coacd_prewarm_workers=0,
-                    collision_coacd_geom_margin=0.0,
-                    collision_coacd_z_offset=0.0,
-                    collision_coacd_auto_align_top_surface=True,
+                    # Use heightfield collision: ray-cast from above at 2 cm resolution.
+                    # Avoids CoACD convex decomposition overhead and correctly handles
+                    # concave / 3D-scanned STL terrains without spurious interior contacts.
+                    # NOTE: MuJoCo hfield collision is limited to 50 contacts per pair;
+                    # resolution must be coarse enough that a robot foot covers < 50 cells.
+                    # At 2 cm, a 10x5 cm foot covers ~12 cells — well within the limit.
+                    collision_hfield=True,
+                    collision_hfield_resolution=0.02,
                 ),
             },
         ),
@@ -946,9 +940,9 @@ class PerceptiveShadowingEnvCfg(InstinctLabRLEnvCfg):
         self.episode_length_s = 10.0
         # simulation settings
         self.sim.mujoco.timestep = 1.0 / 50.0 / self.decimation
-        # Contact budget for perceptive shadowing scene (hfield collision can create
-        # denser initial contacts than mesh-hull collision).
-        self.sim.nconmax = 256
-        self.sim.njmax = 768
+        # Let mujoco-warp auto-infer nconmax/njmax — hfield collision generates more
+        # contacts per step than CoACD hulls, so a fixed cap easily overflows.
+        self.sim.nconmax = None
+        self.sim.njmax = None
 
         # All managers are already dicts, no conversion needed!

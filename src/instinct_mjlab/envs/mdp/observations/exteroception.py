@@ -149,7 +149,7 @@ class delayed_visualizable_image(ManagerTermBase):
     """
 
     def __init__(self, cfg: ManagerTermBaseCfg, env: ManagerBasedEnv):
-        super().__init__(cfg, env)
+        super().__init__(env)
         self.sensor_cfg = cfg.params.get("sensor_cfg", SceneEntityCfg("camera"))
         self.data_type = cfg.params["data_type"]  # must provide the data_type, must have "history" in the data_type
         assert "history" in self.data_type, "data_type must have 'history' in it"

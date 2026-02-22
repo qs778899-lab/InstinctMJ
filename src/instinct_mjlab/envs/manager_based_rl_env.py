@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import torch
 
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 from instinct_mjlab.managers import MultiRewardCfg, MultiRewardManager
 from instinct_mjlab.monitors import MonitorManager
@@ -38,7 +39,10 @@ class InstinctRlEnv(ManagerBasedRlEnv):
 
   def setup_manager_visualizers(self) -> None:
     super().setup_manager_visualizers()
-    if getattr(self, "monitor_manager", None) is not None:
+    if (
+      getattr(self, "monitor_manager", None) is not None
+      and hasattr(self.monitor_manager, "debug_vis")
+    ):
       self.manager_visualizers["monitor_manager"] = self.monitor_manager
 
   def step(self, action: torch.Tensor):
@@ -48,6 +52,12 @@ class InstinctRlEnv(ManagerBasedRlEnv):
       extras.setdefault("step", {})
       extras["step"].update(monitor_infos)
     return obs, reward, terminated, truncated, extras
+
+  def update_visualizers(self, visualizer: DebugVisualizer) -> None:
+    super().update_visualizers(visualizer)
+    terrain = getattr(self.scene, "terrain", None)
+    if terrain is not None and hasattr(terrain, "debug_vis"):
+      terrain.debug_vis(visualizer)
 
   def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None = None) -> None:
     if env_ids is None:

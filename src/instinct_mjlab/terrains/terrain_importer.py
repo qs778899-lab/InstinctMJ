@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 class TerrainImporter(TerrainImporterBase):
     def __init__(self, cfg: TerrainImporterCfg, device: str):
+        self._debug_vis_enabled = False
+        self._collision_debug_vis = bool(getattr(cfg, "collision_debug_vis", False))
+        self._collision_debug_rgba = tuple(getattr(cfg, "collision_debug_rgba", (0.62, 0.2, 0.9, 0.35)))
         self._virtual_obstacles = {}
         for name, virtual_obstacle_cfg in cfg.virtual_obstacles.items():
             if virtual_obstacle_cfg is None:
@@ -39,6 +42,8 @@ class TerrainImporter(TerrainImporterBase):
         terrain_mesh = self._get_terrain_mesh_for_virtual_obstacles()
         if terrain_mesh is not None:
             self._generate_virtual_obstacles(terrain_mesh)
+        if self._collision_debug_vis:
+            self._apply_collision_debug_visual_style()
 
     @property
     def virtual_obstacles(self) -> dict[str, VirtualObstacleBase]:
@@ -109,12 +114,25 @@ class TerrainImporter(TerrainImporterBase):
             with Timer(f"Generate virtual obstacle {name}"):
                 virtual_obstacle.generate(mesh, device=self.device)
 
+    def _apply_collision_debug_visual_style(self) -> None:
+        """Tint terrain collision geoms so they are visible in the viewer."""
+        terrain_body = self._spec.body("terrain")
+        if terrain_body is None:
+            return
+        for geom in terrain_body.geoms:
+            contype = int(getattr(geom, "contype", 1))
+            conaffinity = int(getattr(geom, "conaffinity", 1))
+            if contype == 0 and conaffinity == 0:
+                continue
+            geom.rgba[:] = self._collision_debug_rgba
+
     def set_debug_vis(self, debug_vis: bool) -> bool:
         """Set the debug visualization flag.
 
         Args:
             vis: True to enable debug visualization, False to disable.
         """
+        self._debug_vis_enabled = debug_vis
         results = True
 
         for name, virtual_obstacle in self._virtual_obstacles.items():
@@ -124,6 +142,14 @@ class TerrainImporter(TerrainImporterBase):
                 virtual_obstacle.disable_visualizer()
 
         return results
+
+    def debug_vis(self, visualizer) -> None:
+        """Draw virtual obstacles using viewer-native debug visualizer."""
+        if not self._debug_vis_enabled:
+            return
+        for virtual_obstacle in self._virtual_obstacles.values():
+            if hasattr(virtual_obstacle, "debug_vis"):
+                virtual_obstacle.debug_vis(visualizer)
 
     def configure_env_origins(self, origins: np.ndarray | torch.Tensor | None = None):
         """Configure the environment origins.

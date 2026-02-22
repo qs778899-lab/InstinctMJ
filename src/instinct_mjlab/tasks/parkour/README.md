@@ -1,60 +1,33 @@
 # Parkour Task
 
-## Task IDs
+## Basic Usage Guidelines
 
-- `Instinct-Parkour-Target-Amp-G1-v0`
-- `Instinct-Parkour-Target-Amp-G1-Play-v0`
+### Parkour Task
 
-## Dataset Configuration
+**Task ID:** `Instinct-Parkour-Target-Amp-G1-v0`
 
-Parkour supports two motion-input modes:
+1. Go to `config/g1/g1_parkour_target_amp_cfg.py` and set the `path` and `filtered_motion_selection_filepath` in `AmassMotionCfg` to the reference motion you want to use.
 
-1. Pass `--motion-file /path/to/motion.npz` explicitly.
-2. InstinctLab-style config: set the following fields in
-   `tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py`:
-   - `AmassMotionCfg.path`
-   - `AmassMotionCfg.filtered_motion_selection_filepath`
-
-When mode (2) is used, `instinct-train` / `instinct-play` will resolve motion data from this config.
-
-`motion.npz` must contain:
-
-- `joint_pos`
-- `joint_vel`
-- `body_pos_w`
-- `body_quat_w`
-- `body_lin_vel_w`
-- `body_ang_vel_w`
-
-## Train / Play
-
-Train:
-
+2. Train the policy:
 ```bash
-instinct-train Instinct-Parkour-Target-Amp-G1-v0 --env.scene.num-envs 2048
+instinct-train Instinct-Parkour-Target-Amp-G1-v0
 ```
 
-Train with explicit motion file:
+3. Play trained policy (`--load-run` must be provided, absolute path is recommended, or use `--agent random` to visualize untrained policy):
 
 ```bash
-instinct-train Instinct-Parkour-Target-Amp-G1-v0 \
-  --motion-file /absolute/path/to/motion.npz \
-  --env.scene.num-envs 2048
+instinct-play Instinct-Parkour-Target-Amp-G1-Play-v0 --load-run <run_name>
 ```
 
-Play:
+4. Export trained policy (`--load-run` must be provided, absolute path is recommended):
 
 ```bash
-instinct-play Instinct-Parkour-Target-Amp-G1-Play-v0 \
-  --checkpoint-file /absolute/path/to/model_x.pt \
-  --viewer native
+instinct-play Instinct-Parkour-Target-Amp-G1-Play-v0 --load-run <run_name> --export-onnx
 ```
 
-Play with explicit motion file:
+## Common Options
 
-```bash
-instinct-play Instinct-Parkour-Target-Amp-G1-Play-v0 \
-  --motion-file /absolute/path/to/motion.npz \
-  --checkpoint-file /absolute/path/to/model_x.pt \
-  --viewer native
-```
+- `--num-envs`: Number of parallel environments (default varies by task)
+- `--load-run`: Run name to load checkpoint from for playing
+- `--video`: Record training/playback videos
+- `--export-onnx`: Export the trained model to ONNX format for onboard deployment during playing

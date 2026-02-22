@@ -13,8 +13,6 @@ import tyro
 import instinct_mjlab.tasks  # noqa: F401
 import mjlab
 from instinct_mjlab.utils.motion_validation import (
-  find_default_tracking_motion_file,
-  resolve_datasets_root,
   validate_tracking_motion_file,
 )
 from instinct_mjlab.tasks.registry import list_tasks, load_env_cfg
@@ -74,26 +72,14 @@ def _resolve_tracking_motion(task_id: str, cfg: ProbeConfig, env_cfg) -> None:
   configured_motion = str(getattr(motion_cmd, "motion_file", "")).strip()
   if configured_motion:
     configured_path = Path(configured_motion).expanduser().resolve()
-    try:
-      validate_tracking_motion_file(configured_path)
-    except (ValueError, OSError, FileNotFoundError):
-      pass
-    else:
-      motion_cmd.motion_file = str(configured_path)
-      print(f"[INFO] Using motion file from env config: {configured_path}")
-      return
-
-  default_motion = find_default_tracking_motion_file(task_id)
-  if default_motion is not None:
-    motion_cmd.motion_file = str(default_motion)
-    print(f"[INFO] Auto-selected motion file: {default_motion}")
+    validate_tracking_motion_file(configured_path)
+    motion_cmd.motion_file = str(configured_path)
+    print(f"[INFO] Using motion file from env config: {configured_path}")
     return
 
   raise ValueError(
-    "Tracking 任务需要 motion 数据：\n"
-    "  --motion-file /path/to/motion.npz\n"
-    "  或 --registry-name your-org/motions/motion-name\n"
-    f"当前默认搜索目录: {resolve_datasets_root()} （可用 INSTINCT_DATASETS_ROOT 覆盖）"
+    "Tracking probe requires a motion file.\n"
+    "  --motion-file /path/to/motion.npz"
   )
 
 

@@ -22,8 +22,6 @@ import mjlab
 from instinct_mjlab.rl import InstinctRlVecEnvWrapper
 from instinct_mjlab.utils.distillation import prepare_distillation_algorithm_cfg
 from instinct_mjlab.utils.motion_validation import (
-  find_default_tracking_motion_file,
-  resolve_datasets_root,
   validate_tracking_motion_file,
 )
 from instinct_mjlab.tasks.registry import (
@@ -32,7 +30,7 @@ from instinct_mjlab.tasks.registry import (
   load_instinct_rl_cfg,
   load_runner_cls,
 )
-from mjlab.envs import ManagerBasedRlEnv
+from instinct_mjlab.envs import InstinctRlEnv
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.os import get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
@@ -59,6 +57,9 @@ class PlayConfig:
   video_width: int | None = None
   export_onnx: bool = False
   onnx_output_dir: str | None = None
+  use_onnx: bool = False
+  onnx_model_dir: str | None = None
+  no_resume: bool = False
   no_terminations: bool = False
 
 
@@ -95,6 +96,23 @@ class _ViewerEnvAdapter:
     return self._vec_env.close()
 
 
+class _InstinctViserPlayViewer(ViserPlayViewer):
+  """Viser viewer with optional default collision geom visibility."""
+
+  def __init__(self, *args, show_collision_group3: bool = False, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._show_collision_group3 = show_collision_group3
+
+  def setup(self) -> None:
+    super().setup()
+    if not self._show_collision_group3:
+      return
+    # Group 3 is commonly used for collision geoms (including terrain colliders).
+    self._scene.geom_groups_visible[3] = True
+    self._scene._sync_visibilities()
+    self._scene.needs_update = True
+
+
 def _resolve_device(device: str | None) -> str:
   if device is not None:
     return device
@@ -116,7 +134,7 @@ def _resolve_rollout_steps(cfg: PlayConfig) -> int | None:
   return None
 
 
-def _resolve_tracking_motion(task_id: str, cfg: PlayConfig, env_cfg) -> None:
+def _resolve_tracking_motion(_task_id: str, cfg: PlayConfig, env_cfg) -> None:
   is_tracking_task = "motion" in env_cfg.commands and isinstance(
     env_cfg.commands["motion"], MotionCommandCfg
   )
@@ -148,26 +166,14 @@ def _resolve_tracking_motion(task_id: str, cfg: PlayConfig, env_cfg) -> None:
   configured_motion = str(getattr(motion_cmd, "motion_file", "")).strip()
   if configured_motion:
     configured_path = Path(configured_motion).expanduser().resolve()
-    try:
-      validate_tracking_motion_file(configured_path)
-    except (ValueError, OSError, FileNotFoundError):
-      pass
-    else:
-      motion_cmd.motion_file = str(configured_path)
-      print(f"[INFO] Using motion file from env config: {configured_path}")
-      return
-
-  default_motion = find_default_tracking_motion_file(task_id)
-  if default_motion is not None:
-    motion_cmd.motion_file = str(default_motion)
-    print(f"[INFO] Auto-selected motion file: {default_motion}")
+    validate_tracking_motion_file(configured_path)
+    motion_cmd.motion_file = str(configured_path)
+    print(f"[INFO] Using motion file from env config: {configured_path}")
     return
 
   raise ValueError(
-    "Tracking 任务在回放时必须指定 motion：\n"
-    "  --motion-file /path/to/motion.npz\n"
-    "  或 --registry-name your-org/motions/motion-name\n"
-    f"当前默认搜索目录: {resolve_datasets_root()} （可用 INSTINCT_DATASETS_ROOT 覆盖）"
+    "Tracking play requires a motion file.\n"
+    "  --motion-file /path/to/motion.npz"
   )
 
 
@@ -240,6 +246,87 @@ def _resolve_onnx_output_dir(
   return Path("logs") / "instinct_rl" / agent_cfg.experiment_name / task_id / "exported"
 
 
+def _resolve_onnx_model_dir(
+  *,
+  cfg: PlayConfig,
+  agent_cfg,
+  checkpoint: Path | None,
+) -> Path:
+  if cfg.onnx_model_dir is not None:
+    return Path(cfg.onnx_model_dir).expanduser().resolve()
+  if checkpoint is not None:
+    return checkpoint.parent / "exported"
+  if cfg.load_run:
+    load_run = Path(cfg.load_run).expanduser()
+    if load_run.is_absolute():
+      return load_run.resolve() / "exported"
+    return Path("logs") / "instinct_rl" / agent_cfg.experiment_name / cfg.load_run / "exported"
+  run_name = str(getattr(agent_cfg, "run_name", "") or "")
+  return Path("logs") / "instinct_rl" / agent_cfg.experiment_name / f"{run_name}_play" / "exported"
+
+
+def _build_parkour_onnx_policy(
+  *,
+  vec_env: InstinctRlVecEnvWrapper,
+  agent_cfg,
+  model_dir: Path,
+):
+  from instinct_rl.utils.utils import get_subobs_by_components, get_subobs_size
+
+  try:
+    from instinct_mjlab.tasks.parkour.scripts.onnxer import load_parkour_onnx_model
+  except ModuleNotFoundError as err:
+    if err.name == "onnxruntime":
+      raise ModuleNotFoundError(
+        "ONNX inference requires `onnxruntime` or `onnxruntime-gpu`. "
+        "Install one of them and retry."
+      ) from err
+    raise
+
+  encoder_path = model_dir / "0-depth_encoder.onnx"
+  actor_path = model_dir / "actor.onnx"
+  missing_files = [str(path) for path in (encoder_path, actor_path) if not path.exists()]
+  if missing_files:
+    missing_lines = "\n".join(f"  - {path}" for path in missing_files)
+    raise FileNotFoundError(f"Missing ONNX model files:\n{missing_lines}")
+
+  obs_segments = vec_env.get_obs_format()["policy"]
+  if "depth_image" not in obs_segments:
+    raise ValueError("Parkour ONNX inference requires `depth_image` in policy observations.")
+
+  try:
+    depth_components = agent_cfg.policy.encoder_configs.depth_encoder.component_names
+  except AttributeError as err:
+    raise ValueError(
+      "Unable to read depth encoder component names from agent config. "
+      "This ONNX path currently supports parkour policy configs."
+    ) from err
+
+  proprio_components = [
+    "base_lin_vel",
+    "base_ang_vel",
+    "projected_gravity",
+    "velocity_commands",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+  ]
+  return load_parkour_onnx_model(
+    model_dir=str(model_dir),
+    get_subobs_func=lambda obs: get_subobs_by_components(
+      obs,
+      depth_components,
+      obs_segments,
+      temporal=True,
+    ),
+    depth_shape=obs_segments["depth_image"],
+    proprio_slice=slice(
+      0,
+      get_subobs_size(obs_segments, proprio_components),
+    ),
+  )
+
+
 def _export_policy_to_onnx(
   *,
   runner,
@@ -253,7 +340,7 @@ def _export_policy_to_onnx(
     runner.export_as_onnx(obs=observations, export_model_dir=str(export_dir))
   except ModuleNotFoundError as err:
     raise ModuleNotFoundError(
-      "ONNX 导出失败：缺少依赖。请安装 `onnx` 后重试。"
+      "ONNX export failed: missing dependency. Install `onnx` and retry."
     ) from err
 
   metadata = {
@@ -315,12 +402,26 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
     print("[INFO] All terminations are disabled for play.")
 
   _resolve_tracking_motion(task_id, cfg, env_cfg)
-  if cfg.agent == "trained":
-    checkpoint = _resolve_checkpoint(task_id, cfg, agent_cfg)
-  elif cfg.export_onnx:
-    raise ValueError("`--export-onnx` 仅支持 `--agent trained`。")
+  if cfg.use_onnx and "Parkour" not in task_id:
+    raise ValueError("`--use-onnx` currently only supports parkour tasks.")
+  if cfg.use_onnx and cfg.agent != "trained":
+    raise ValueError("`--use-onnx` only supports `--agent trained`.")
 
-  env = ManagerBasedRlEnv(
+  if cfg.agent == "trained":
+    if cfg.no_resume:
+      if cfg.export_onnx:
+        raise ValueError("`--no-resume` cannot be combined with `--export-onnx`.")
+      if not cfg.use_onnx:
+        raise ValueError(
+          "`--no-resume` with `--agent trained` requires `--use-onnx True`."
+        )
+      print("[INFO] No-resume mode is enabled. Skip checkpoint loading and use ONNX policy.")
+    else:
+      checkpoint = _resolve_checkpoint(task_id, cfg, agent_cfg)
+  elif cfg.export_onnx:
+    raise ValueError("`--export-onnx` only supports `--agent trained`.")
+
+  env = InstinctRlEnv(
     cfg=env_cfg,
     device=device,
     render_mode="rgb_array" if cfg.video else None,
@@ -353,25 +454,31 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   if cfg.agent in {"zero", "random"}:
     policy = _build_dummy_policy(cfg.agent, (vec_env.num_envs, vec_env.num_actions), device)
   else:
-    runner_cls = load_runner_cls(task_id) or OnPolicyRunner
-    agent_cfg_dict = asdict(agent_cfg)
-    prepare_distillation_algorithm_cfg(
-      agent_cfg=agent_cfg_dict,
-      obs_format=vec_env.get_obs_format(),
-      num_actions=vec_env.num_actions,
-      num_rewards=vec_env.num_rewards,
-    )
-    runner = runner_cls(
-      vec_env,
-      agent_cfg_dict,
-      log_dir=None,
-      device=device,
-    )
-    assert checkpoint is not None
-    runner.load(str(checkpoint))
-    policy = runner.get_inference_policy(device=device)
-    print(f"[INFO] Loaded checkpoint: {checkpoint}")
+    runner = None
+    if checkpoint is not None or cfg.export_onnx:
+      runner_cls = load_runner_cls(task_id) or OnPolicyRunner
+      agent_cfg_dict = asdict(agent_cfg)
+      prepare_distillation_algorithm_cfg(
+        agent_cfg=agent_cfg_dict,
+        obs_format=vec_env.get_obs_format(),
+        num_actions=vec_env.num_actions,
+        num_rewards=vec_env.num_rewards,
+      )
+      runner = runner_cls(
+        vec_env,
+        agent_cfg_dict,
+        log_dir=None,
+        device=device,
+      )
+
+    if checkpoint is not None:
+      assert runner is not None
+      runner.load(str(checkpoint))
+      print(f"[INFO] Loaded checkpoint: {checkpoint}")
+
     if cfg.export_onnx:
+      assert checkpoint is not None
+      assert runner is not None
       onnx_output_dir = _resolve_onnx_output_dir(
         cfg=cfg,
         task_id=task_id,
@@ -385,12 +492,35 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
         export_dir=onnx_output_dir,
       )
 
+    if cfg.use_onnx:
+      onnx_model_dir = _resolve_onnx_model_dir(
+        cfg=cfg,
+        agent_cfg=agent_cfg,
+        checkpoint=checkpoint,
+      )
+      policy = _build_parkour_onnx_policy(
+        vec_env=vec_env,
+        agent_cfg=agent_cfg,
+        model_dir=onnx_model_dir,
+      )
+      print(f"[INFO] Loaded ONNX policy from: {onnx_model_dir}")
+    else:
+      assert runner is not None
+      policy = runner.get_inference_policy(device=device)
+
   rollout_steps = _resolve_rollout_steps(cfg)
 
   if viewer_backend == "native":
     NativeMujocoViewer(viewer_env, policy).run(num_steps=rollout_steps)
   elif viewer_backend == "viser":
-    ViserPlayViewer(viewer_env, policy).run(num_steps=rollout_steps)
+    show_collision_group3 = "Parkour" in task_id
+    if show_collision_group3:
+      print("[INFO] Enabled geom group G3 visibility for parkour collision debug.")
+    _InstinctViserPlayViewer(
+      viewer_env,
+      policy,
+      show_collision_group3=show_collision_group3,
+    ).run(num_steps=rollout_steps)
   elif viewer_backend == "none":
     _run_headless_rollout(
       viewer_env,

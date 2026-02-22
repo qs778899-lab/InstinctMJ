@@ -13,6 +13,7 @@ def register_virtual_obstacle_to_sensor(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
     sensor_cfgs: list[SceneEntityCfg] | SceneEntityCfg,
+    enable_debug_vis: bool = False,
 ):
     """Make each sensor accessible to the terrain virtual obstacle by providing `sensor.register_virtual_obstacles` with
     `terrain.virtual_obstacles` dict.
@@ -42,3 +43,11 @@ def register_virtual_obstacle_to_sensor(
             )
 
         sensor.register_virtual_obstacles(virtual_obstacles)
+
+    if enable_debug_vis:
+        if not hasattr(env.scene.terrain, "set_debug_vis"):
+            raise TypeError(
+                "register_virtual_obstacle_to_sensor requires terrain.set_debug_vis() when "
+                "enable_debug_vis=True."
+            )
+        env.scene.terrain.set_debug_vis(True)

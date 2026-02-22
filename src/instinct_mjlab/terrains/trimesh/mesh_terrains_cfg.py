@@ -64,14 +64,37 @@ class MotionMatchedTerrainCfg(SubTerrainBaseCfg):
     Enabling this keeps visual mesh fidelity while using a heightfield collision surface.
     """
 
-    collision_hfield_resolution: float = 0.05
-    """Sampling resolution (meters) used to build the collision hfield from terrain mesh."""
+    collision_hfield_resolution: float = 0.01
+    """Sampling resolution (meters) used to build the collision hfield from terrain mesh.
+
+    Each grid point fires a downward ray and records the highest intersection with the mesh.
+    Default 0.01 (1 cm) gives accurate collision at the cost of a larger hfield array.
+    """
 
     collision_hfield_normal_z_threshold: float = 0.15
-    """Only faces with normal_z above this threshold contribute to top-surface sampling."""
+    """Only faces with normal_z above this threshold contribute to top-surface sampling.
+
+    Used only by the CoACD auto-align top-surface computation, not by the hfield ray-caster.
+    """
 
     collision_hfield_base_thickness_ratio: float = 1.0
     """Base thickness ratio for the generated collision hfield."""
+
+    collision_hfield_num_workers: int = 0
+    """Number of worker processes for parallel hfield ray-casting.
+
+    Set to 0 to use all CPU cores, and 1 to disable multiprocessing (single-process).
+    """
+
+    collision_hfield_use_disk_cache: bool = True
+    """If True, persist hfield height arrays to disk for reuse across runs.
+
+    The cache is keyed by STL file path, mtime, file size, resolution, and terrain size,
+    so it is automatically invalidated when the STL file changes.
+    """
+
+    collision_hfield_cache_dirname: str = ".hfield_cache"
+    """Cache directory name created next to each imported STL file."""
 
     face_box_collision: bool = False
     """If True, replace mesh collision with per-face thin box geoms.

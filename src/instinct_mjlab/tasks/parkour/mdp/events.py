@@ -42,7 +42,7 @@ def randomize_rigid_body_material(
 
 def push_by_setting_velocity_without_stand(
   env: ManagerBasedRlEnv,
-  env_ids: torch.Tensor | None,
+  env_ids: torch.Tensor,
   velocity_range: dict[str, tuple[float, float]],
   command_name: str,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -52,11 +52,6 @@ def push_by_setting_velocity_without_stand(
 
   Mirrors the original InstinctLab ``push_by_setting_velocity_without_stand``.
   """
-  if env_ids is None:
-    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
-  if env_ids.numel() == 0:
-    return
-
   asset: Entity = env.scene[asset_cfg.name]
   vel_w = asset.data.root_link_vel_w[env_ids]
 

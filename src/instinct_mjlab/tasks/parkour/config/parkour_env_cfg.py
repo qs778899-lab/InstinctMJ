@@ -37,12 +37,17 @@ from mjlab.terrains import FlatPatchSamplingCfg
 from mjlab.utils.noise import UniformNoiseCfg
 
 import instinct_mjlab.envs.mdp as instinct_envs_mdp
+from instinct_mjlab.assets.unitree_g1 import G1_29DOF_INSTINCTLAB_JOINT_ORDER
+from instinct_mjlab.sensors.noisy_camera import NoisyGroupedRayCasterCameraCfg
 from instinct_mjlab.sensors.volume_points import (
   Grid3dPointsGeneratorCfg,
   VolumePointsCfg,
 )
+from instinct_mjlab.tasks.config.scene_style_cfg import (
+  SceneVisualStyleCfg,
+  apply_scene_visual_style,
+)
 from instinct_mjlab.tasks.mdp import (
-  PerceptiveRaycastNoisedHistory,
   parkour_amp_reference_base_ang_vel,
   parkour_amp_reference_base_lin_vel,
   parkour_amp_reference_joint_pos_rel,
@@ -51,6 +56,11 @@ from instinct_mjlab.tasks.mdp import (
 )
 import instinct_mjlab.tasks.parkour.mdp as parkour_mdp
 from instinct_mjlab.tasks.parkour.mdp.commands import PoseVelocityCommandCfg
+from instinct_mjlab.utils.noise import (
+  CropAndResizeCfg,
+  DepthNormalizationCfg,
+  GaussianBlurNoiseCfg,
+)
 from instinct_mjlab.terrains.height_field.hf_terrains_cfg import (
   PerlinDiscreteObstaclesTerrainCfg,
   PerlinInvertedPyramidSlopedTerrainCfg,
@@ -77,7 +87,8 @@ _PARKOUR_AMP_HISTORY_LENGTH = 10
 _PARKOUR_PROPRIO_HISTORY_LENGTH = 8
 _PARKOUR_DEPTH_HISTORY_LENGTH = 37
 _PARKOUR_DEPTH_SKIP_FRAMES = 5
-_MOTION_COMMAND_NAME = "motion"
+_PARKOUR_DEPTH_OUTPUT_FRAMES = 8
+_PARKOUR_DEPTH_DELAYED_FRAME_RANGES = (0, 1)
 _BASE_VELOCITY_COMMAND_NAME = "base_velocity"
 _FEET_CONTACT_SENSOR_NAME = "contact_forces"
 _TORSO_CONTACT_SENSOR_NAME = "torso_contact_forces"
@@ -147,7 +158,7 @@ _PARKOUR_BASE_VELOCITY_RANGES = {
 ROUGH_TERRAINS_CFG = FiledTerrainGeneratorCfg(
   seed=0,
   size=(8.0, 8.0),
-  border_width=3,
+  border_width=3.0,
   num_rows=10,
   num_cols=20,
   horizontal_scale=0.05,
@@ -155,6 +166,7 @@ ROUGH_TERRAINS_CFG = FiledTerrainGeneratorCfg(
   slope_threshold=1.0,
   use_cache=False,
   curriculum=True,
+  add_lights=True,
   sub_terrains={
     "perlin_rough": PerlinPlaneTerrainCfg(
       proportion=0.05,
@@ -411,18 +423,6 @@ def set_parkour_scene_sensors(cfg: ManagerBasedRlEnvCfg) -> None:
   contact_forces, torso_contact_forces, undesired_contact_forces,
   leg_volume_points, left/right_height_scanner, and camera.
   """
-  replace_names = {
-    _FEET_CONTACT_SENSOR_NAME,
-    _TORSO_CONTACT_SENSOR_NAME,
-    _UNDESIRED_CONTACT_SENSOR_NAME,
-    _LEG_VOLUME_POINTS_SENSOR_NAME,
-    _LEFT_HEIGHT_SCANNER_NAME,
-    _RIGHT_HEIGHT_SCANNER_NAME,
-    _DEPTH_CAMERA_SENSOR_NAME,
-  }
-  existing_sensors = tuple(
-    sensor_cfg for sensor_cfg in cfg.scene.sensors if sensor_cfg.name not in replace_names
-  )
   feet_contact_sensor = ContactSensorCfg(
     name=_FEET_CONTACT_SENSOR_NAME,
     primary=ContactMatch(
@@ -431,7 +431,7 @@ def set_parkour_scene_sensors(cfg: ManagerBasedRlEnvCfg) -> None:
       entity="robot",
     ),
     fields=("found", "force"),
-    reduce="maxforce",
+    reduce="netforce",
     track_air_time=True,
     history_length=3,
   )
@@ -439,7 +439,7 @@ def set_parkour_scene_sensors(cfg: ManagerBasedRlEnvCfg) -> None:
     name=_TORSO_CONTACT_SENSOR_NAME,
     primary=ContactMatch(mode="body", pattern="torso_link", entity="robot"),
     fields=("found", "force"),
-    reduce="maxforce",
+    reduce="netforce",
     track_air_time=False,
     history_length=3,
   )
@@ -452,7 +452,7 @@ def set_parkour_scene_sensors(cfg: ManagerBasedRlEnvCfg) -> None:
       exclude=("left_ankle_roll_link", "right_ankle_roll_link"),
     ),
     fields=("found", "force"),
-    reduce="maxforce",
+    reduce="netforce",
     track_air_time=False,
     history_length=3,
   )
@@ -489,15 +489,50 @@ def set_parkour_scene_sensors(cfg: ManagerBasedRlEnvCfg) -> None:
     max_distance=10.0,
     debug_vis=False,
   )
-  depth_camera_sensor = RayCastSensorCfg(
+  depth_camera_sensor = NoisyGroupedRayCasterCameraCfg(
     name=_DEPTH_CAMERA_SENSOR_NAME,
     frame=ObjRef(type="body", name="torso_link", entity="robot"),
-    pattern=PinholeCameraPatternCfg(width=64, height=36, fovy=58.29),
+    pattern=PinholeCameraPatternCfg(
+      width=64,
+      height=36,
+      fovy=58.29,
+    ),
+    focal_length=1.0,
+    horizontal_aperture=2 * math.tan(math.radians(89.51) / 2.0),
+    vertical_aperture=2 * math.tan(math.radians(58.29) / 2.0),
     ray_alignment="base",
+    offset=NoisyGroupedRayCasterCameraCfg.OffsetCfg(
+      # G1 Robot head camera nominal pose
+      pos=(
+        0.0487988662332928,
+        0.01,
+        0.4378029937970051,
+      ),
+      rot=(
+        0.9135367613482678,
+        0.004363309284746571,
+        0.4067366430758002,
+        0.0,
+      ),
+      convention="world",
+    ),
+    data_types=["distance_to_image_plane"],
+    depth_clipping_behavior="max",
+    noise_pipeline={
+      "crop_and_resize": CropAndResizeCfg(crop_region=(18, 0, 16, 16)),
+      "gaussian_blur": GaussianBlurNoiseCfg(kernel_size=3, sigma=1),
+      "depth_normalization": DepthNormalizationCfg(
+        depth_range=(0.0, 2.5),
+        normalize=True,
+        output_range=(0.0, 1.0),
+      ),
+    },
+    data_histories={"distance_to_image_plane_noised": _PARKOUR_DEPTH_HISTORY_LENGTH},
+    min_distance=0.1,
     max_distance=2.5,
     debug_vis=False,
   )
-  cfg.scene.sensors = existing_sensors + (
+  cfg.scene.sensors = (
     feet_contact_sensor,
     torso_contact_sensor,
     undesired_contact_sensor,
@@ -523,21 +558,23 @@ def set_parkour_commands(cfg: ManagerBasedRlEnvCfg) -> None:
     lin_vel_y=(0.0, 0.0),
     ang_vel_z=(-1.0, 1.0),
   )
-  cfg.commands[_BASE_VELOCITY_COMMAND_NAME] = PoseVelocityCommandCfg(
-    entity_name="robot",
-    resampling_time_range=(8.0, 12.0),
-    debug_vis=False,
-    velocity_control_stiffness=2.0,
-    heading_control_stiffness=2.0,
-    rel_standing_envs=0.05,
-    ranges=ranges_cfg,
-    random_velocity_terrain=["perlin_rough_stand"],
-    velocity_ranges=copy.deepcopy(_PARKOUR_BASE_VELOCITY_RANGES),
-    only_positive_lin_vel_x=True,
-    lin_vel_threshold=0.0,
-    ang_vel_threshold=0.0,
-    target_dis_threshold=0.4,
-  )
+  cfg.commands = {
+    _BASE_VELOCITY_COMMAND_NAME: PoseVelocityCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(8.0, 12.0),
+      debug_vis=False,
+      velocity_control_stiffness=2.0,
+      heading_control_stiffness=2.0,
+      rel_standing_envs=0.05,
+      ranges=ranges_cfg,
+      random_velocity_terrain=["perlin_rough_stand"],
+      velocity_ranges=copy.deepcopy(_PARKOUR_BASE_VELOCITY_RANGES),
+      only_positive_lin_vel_x=True,
+      lin_vel_threshold=0.0,
+      ang_vel_threshold=0.0,
+      target_dis_threshold=0.4,
+    ),
+  }
 
 
 # ---------------------------------------------------------------------------
@@ -574,12 +611,26 @@ def set_parkour_observations(cfg: ManagerBasedRlEnvCfg) -> None:
     ),
     "joint_pos": ObservationTermCfg(
       func=envs_mdp.joint_pos_rel,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        ),
+      },
       noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
       history_length=_PARKOUR_PROPRIO_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "joint_vel": ObservationTermCfg(
       func=envs_mdp.joint_vel_rel,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        ),
+      },
       noise=UniformNoiseCfg(n_min=-0.5, n_max=0.5),
       scale=0.05,
       history_length=_PARKOUR_PROPRIO_HISTORY_LENGTH,
@@ -591,21 +642,14 @@ def set_parkour_observations(cfg: ManagerBasedRlEnvCfg) -> None:
       flatten_history_dim=True,
     ),
     "depth_image": ObservationTermCfg(
-      func=PerceptiveRaycastNoisedHistory,
+      func=instinct_envs_mdp.delayed_visualizable_image,
       params={
-        # noise
-        "sensor_name": _DEPTH_CAMERA_SENSOR_NAME,
-        "min_depth": 0.0,
-        "max_depth": 2.5,
-        "crop_top": 18,
-        "crop_bottom": 2,
-        "crop_left": 0,
-        "crop_right": 48,
-        "output_height": 16,
-        "output_width": 16,
-        "history_length": _PARKOUR_DEPTH_HISTORY_LENGTH,
+        "data_type": "distance_to_image_plane_noised_history",
+        "sensor_cfg": SceneEntityCfg(_DEPTH_CAMERA_SENSOR_NAME),
         "history_skip_frames": _PARKOUR_DEPTH_SKIP_FRAMES,
-        "update_period_s": 0.02,
+        "num_output_frames": _PARKOUR_DEPTH_OUTPUT_FRAMES,
+        "delayed_frame_ranges": _PARKOUR_DEPTH_DELAYED_FRAME_RANGES,
+        "debug_vis": False,
       },
       noise=None,
     ),
@@ -636,11 +680,25 @@ def set_parkour_observations(cfg: ManagerBasedRlEnvCfg) -> None:
     ),
     "joint_pos": ObservationTermCfg(
       func=envs_mdp.joint_pos_rel,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        ),
+      },
       history_length=_PARKOUR_PROPRIO_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "joint_vel": ObservationTermCfg(
       func=envs_mdp.joint_vel_rel,
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        ),
+      },
       scale=0.05,
       history_length=_PARKOUR_PROPRIO_HISTORY_LENGTH,
       flatten_history_dim=True,
@@ -651,20 +709,14 @@ def set_parkour_observations(cfg: ManagerBasedRlEnvCfg) -> None:
       flatten_history_dim=True,
     ),
     "depth_image": ObservationTermCfg(
-      func=PerceptiveRaycastNoisedHistory,
+      func=instinct_envs_mdp.delayed_visualizable_image,
       params={
-        "sensor_name": _DEPTH_CAMERA_SENSOR_NAME,
-        "min_depth": 0.0,
-        "max_depth": 2.5,
-        "crop_top": 18,
-        "crop_bottom": 2,
-        "crop_left": 0,
-        "crop_right": 48,
-        "output_height": 16,
-        "output_width": 16,
-        "history_length": _PARKOUR_DEPTH_HISTORY_LENGTH,
+        "data_type": "distance_to_image_plane_noised_history",
+        "sensor_cfg": SceneEntityCfg(_DEPTH_CAMERA_SENSOR_NAME),
         "history_skip_frames": _PARKOUR_DEPTH_SKIP_FRAMES,
-        "update_period_s": 0.02,
+        "num_output_frames": _PARKOUR_DEPTH_OUTPUT_FRAMES,
+        "delayed_frame_ranges": _PARKOUR_DEPTH_DELAYED_FRAME_RANGES,
+        "debug_vis": False,
       },
       noise=None,
     ),
@@ -695,13 +747,25 @@ def set_parkour_amp_observations(cfg: ManagerBasedRlEnvCfg) -> None:
     ),
     "joint_pos_rel": ObservationTermCfg(
       func=envs_mdp.joint_pos_rel,
-      params={"asset_cfg": SceneEntityCfg(name="robot", preserve_order=True)},
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        )
+      },
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "joint_vel": ObservationTermCfg(
       func=envs_mdp.joint_vel_rel,
-      params={"asset_cfg": SceneEntityCfg(name="robot", preserve_order=True)},
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="robot",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        )
+      },
       scale=0.05,
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
@@ -722,32 +786,44 @@ def set_parkour_amp_observations(cfg: ManagerBasedRlEnvCfg) -> None:
   amp_reference_terms = {
     "projected_gravity": ObservationTermCfg(
       func=parkour_amp_reference_projected_gravity,
-      params={"command_name": _MOTION_COMMAND_NAME},
+      params={"asset_cfg": SceneEntityCfg(name="motion_reference")},
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "joint_pos_rel": ObservationTermCfg(
       func=parkour_amp_reference_joint_pos_rel,
-      params={"command_name": _MOTION_COMMAND_NAME, "robot_name": "robot"},
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="motion_reference",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        )
+      },
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "joint_vel": ObservationTermCfg(
       func=parkour_amp_reference_joint_vel_rel,
-      params={"command_name": _MOTION_COMMAND_NAME, "robot_name": "robot"},
+      params={
+        "asset_cfg": SceneEntityCfg(
+          name="motion_reference",
+          joint_names=G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+          preserve_order=True,
+        )
+      },
       scale=0.05,
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "base_lin_vel": ObservationTermCfg(
       func=parkour_amp_reference_base_lin_vel,
-      params={"command_name": _MOTION_COMMAND_NAME},
+      params={"asset_cfg": SceneEntityCfg(name="motion_reference")},
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
     "base_ang_vel": ObservationTermCfg(
       func=parkour_amp_reference_base_ang_vel,
-      params={"command_name": _MOTION_COMMAND_NAME},
+      params={"asset_cfg": SceneEntityCfg(name="motion_reference")},
       history_length=_PARKOUR_AMP_HISTORY_LENGTH,
       flatten_history_dim=True,
     ),
@@ -842,7 +918,7 @@ def set_parkour_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     ),
     "ang_vel_xy_l2": RewardTermCfg(func=parkour_mdp.ang_vel_xy_l2, weight=-0.05),
     "dof_torques_l2": RewardTermCfg(
-      func=envs_mdp.joint_torques_l2,
+      func=parkour_mdp.joint_torques_l2,
       weight=-1.5e-7,
       params={
         "asset_cfg": SceneEntityCfg(
@@ -969,7 +1045,7 @@ def set_parkour_terminations(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.terminations = {
     "time_out": TerminationTermCfg(func=envs_mdp.time_out, time_out=True),
     "terrain_out_bound": TerminationTermCfg(
-      func=parkour_mdp.terrain_out_of_bounds,
+      func=parkour_mdp.sub_terrain_out_of_bounds,
       time_out=True,
       params={"distance_buffer": 2.0},
     ),
@@ -1072,16 +1148,33 @@ def set_parkour_curriculum(cfg: ManagerBasedRlEnvCfg) -> None:
 def set_parkour_terrain(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
   """Set parkour terrain configuration (in-place)."""
   terrain_gen = rough_terrains_cfg(play=play)
+  edge_obstacle_cfg = GreedyconcatEdgeCylinderCfg(
+    cylinder_radius=0.05,
+    min_points=2,
+  )
   cfg.scene.terrain = TerrainImporterCfg(
     terrain_type="generator",
     terrain_generator=copy.deepcopy(terrain_gen),
     max_init_terrain_level=5,
+    collision_debug_vis=False,
+    collision_debug_rgba=(0.62, 0.2, 0.9, 0.35),
     virtual_obstacles={
-      "edges": GreedyconcatEdgeCylinderCfg(
-        cylinder_radius=0.05,
-        min_points=2,
-      ),
+      "edges": edge_obstacle_cfg,
     },
+  )
+
+
+def set_parkour_scene_visual_style(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Set parkour scene visual style (bright sky + bright ground)."""
+  apply_scene_visual_style(
+    cfg.scene,
+    style_name="parkour",
+    style_cfg=SceneVisualStyleCfg(
+      ground_rgb1=(0.92, 0.92, 0.92),
+      ground_rgb2=(0.92, 0.92, 0.92),
+      ground_mark_rgb=(0.92, 0.92, 0.92),
+    ),
+    preserve_collision_rgba=False,
   )
 
 
@@ -1098,6 +1191,14 @@ def set_parkour_basic_settings(cfg: ManagerBasedRlEnvCfg) -> None:
   cfg.scene.num_envs = 4096
   cfg.scene.env_spacing = 2.5
   cfg.episode_length_s = 20.0
+  # Parkour introduces many simultaneous terrain contacts; fixed small caps from
+  # tracking (nconmax=35, njmax=250) can overflow and drop contact constraints.
+  # Keep contact slots auto-sized, but raise constraint capacity to avoid
+  # frequent "nefc overflow" warnings under rough-terrain contact bursts.
+  cfg.sim.nconmax = None
+  cfg.sim.njmax = 384
+  # Increase CCD iterations moderately to reduce "opt.ccd_iterations needs to be increased".
+  cfg.sim.mujoco.ccd_iterations = 100
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1225,7 @@ def set_parkour_play_overrides(cfg: ManagerBasedRlEnvCfg) -> None:
     if sensor_cfg.name == _LEG_VOLUME_POINTS_SENSOR_NAME:
       sensor_cfg.debug_vis = True
 
+  cfg.scene.terrain.collision_debug_vis = True
   cfg.commands[_BASE_VELOCITY_COMMAND_NAME].debug_vis = True
 
   cfg.terminations["root_height"] = None

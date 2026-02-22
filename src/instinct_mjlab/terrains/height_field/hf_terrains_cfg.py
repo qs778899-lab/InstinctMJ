@@ -11,6 +11,7 @@ from mjlab.terrains.height_field import (
     HfTerrainBaseCfg,
     HfWaveTerrainCfg,
 )
+from mjlab.terrains.terrain_generator import FlatPatchSamplingCfg
 
 from . import hf_terrains
 
@@ -20,6 +21,7 @@ class WallTerrainCfgMixin:
     horizontal_scale: float = 0.1
     vertical_scale: float = 0.005
     slope_threshold: float | None = None
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
     wall_prob: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])  # Probability of generating walls on [left, right, front, back] sides
     wall_height: float = 5.0  # Height of the walls
     wall_thickness: float = 0.05  # Thickness of the walls
@@ -27,6 +29,7 @@ class WallTerrainCfgMixin:
 @dataclass(kw_only=True)
 class PerlinPlaneTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_plane_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     noise_scale: float | List[float] = 0.05
     noise_frequency: int = 20
@@ -42,6 +45,7 @@ class PerlinPlaneTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
 @dataclass(kw_only=True)
 class PerlinPyramidSlopedTerrainCfg(HfPyramidSlopedTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_pyramid_sloped_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     slope_range: tuple[float, float] = MISSING
     platform_width: float = 1.0
@@ -51,6 +55,7 @@ class PerlinPyramidSlopedTerrainCfg(HfPyramidSlopedTerrainCfg, WallTerrainCfgMix
 @dataclass(kw_only=True)
 class PerlinInvertedPyramidSlopedTerrainCfg(HfInvertedPyramidSlopedTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_pyramid_sloped_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     slope_range: tuple[float, float] = MISSING
     platform_width: float = 1.0
@@ -60,6 +65,7 @@ class PerlinInvertedPyramidSlopedTerrainCfg(HfInvertedPyramidSlopedTerrainCfg, W
 @dataclass(kw_only=True)
 class PerlinPyramidStairsTerrainCfg(HfPyramidStairsTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_pyramid_stairs_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     step_height_range: tuple[float, float] = MISSING
     step_width: float = MISSING
@@ -70,6 +76,7 @@ class PerlinPyramidStairsTerrainCfg(HfPyramidStairsTerrainCfg, WallTerrainCfgMix
 @dataclass(kw_only=True)
 class PerlinInvertedPyramidStairsTerrainCfg(HfInvertedPyramidStairsTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_pyramid_stairs_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     step_height_range: tuple[float, float] = MISSING
     step_width: float = MISSING
@@ -80,6 +87,7 @@ class PerlinInvertedPyramidStairsTerrainCfg(HfInvertedPyramidStairsTerrainCfg, W
 @dataclass(kw_only=True)
 class PerlinDiscreteObstaclesTerrainCfg(HfDiscreteObstaclesTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_discrete_obstacles_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     obstacle_height_mode: str = "choice"
     obstacle_width_range: tuple[float, float] = MISSING
@@ -91,6 +99,7 @@ class PerlinDiscreteObstaclesTerrainCfg(HfDiscreteObstaclesTerrainCfg, WallTerra
 @dataclass(kw_only=True)
 class PerlinWaveTerrainCfg(HfWaveTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_wave_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     amplitude_range: tuple[float, float] = MISSING
     num_waves: int = 1
@@ -99,6 +108,7 @@ class PerlinWaveTerrainCfg(HfWaveTerrainCfg, WallTerrainCfgMixin):
 @dataclass(kw_only=True)
 class PerlinSteppingStonesTerrainCfg(HfSteppingStonesTerrainCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_stepping_stones_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     stone_height_max: float = MISSING
     stone_width_range: tuple[float, float] = MISSING
@@ -113,6 +123,7 @@ class PerlinParapetTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a parapet terrain, can be used for jump and hurdle tasks."""
 
     function: object = hf_terrains.perlin_parapet_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     parapet_height: tuple[float, float] | float = (0.1, 0.3)
     parapet_length: tuple[float, float] | float = (0.1, 0.3)
@@ -126,6 +137,7 @@ class PerlinGutterTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a gutter parkour terrain."""
 
     function: object = hf_terrains.perlin_gutter_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     gutter_length: tuple[float, float] | float = (0.5, 1.5)  # the distance between gutters
     gutter_depth: tuple[float, float] | float = (0.1, 0.3)  # the depth of the gutter
@@ -137,6 +149,7 @@ class PerlinStairsUpDownTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a stairs up and down parkour terrain."""
 
     function: object = hf_terrains.perlin_stairs_up_down_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     per_step_height: tuple[float, float] | float = MISSING
     """The height of each step. Could be a fixed value or a range (min, max)."""
@@ -157,6 +170,7 @@ class PerlinStairsDownUpTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a stairs down and up parkour terrain."""
 
     function: object = hf_terrains.perlin_stairs_down_up_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     per_step_height: tuple[float, float] | float = MISSING
     """The height of each step. Could be a fixed value or a range (min, max)."""
@@ -177,6 +191,7 @@ class PerlinTiltTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a tilt terrain."""
 
     function: object = hf_terrains.perlin_tilt_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     wall_height: tuple[float, float] | float = MISSING
     wall_width: float | None = None
@@ -190,6 +205,7 @@ class PerlinTiltedRampTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a tilted ramp terrain."""
 
     function: object = hf_terrains.perlin_tilted_ramp_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     tilt_angle: tuple[float, float] | float = MISSING  # in degrees
     tilt_height: tuple[float, float] | float = MISSING
@@ -205,6 +221,7 @@ class PerlinSlopeTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a slope up and down terrain with a flat ground in the middle."""
 
     function: object = hf_terrains.perlin_slope_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     slope_angle: tuple[float, float] | float = MISSING  # in degrees
     per_slope_length: tuple[float, float] | float = MISSING
@@ -218,6 +235,7 @@ class PerlinCrossStoneTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     """Configuration for a cross stone terrain."""
 
     function: object = hf_terrains.perlin_cross_stone_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     stone_size: tuple[float, float] = MISSING
     stone_height: tuple[float, float] | float = MISSING
@@ -230,6 +248,7 @@ class PerlinCrossStoneTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
 @dataclass(kw_only=True)
 class PerlinSquareGapTerrainCfg(HfTerrainBaseCfg, WallTerrainCfgMixin):
     function: object = hf_terrains.perlin_square_gap_terrain
+    flat_patch_sampling: dict[str, FlatPatchSamplingCfg] | None = None
 
     gap_distance_range: tuple[float, float] = (0.1, 0.5)
     gap_depth: tuple[float, float] = (0.2, 0.5)

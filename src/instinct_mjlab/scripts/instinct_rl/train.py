@@ -6,9 +6,10 @@ Migrated: replaces Isaac Sim / Isaac Lab runtime with mjlab + tyro CLI.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -26,8 +27,6 @@ from instinct_mjlab.utils.distillation import (
   validate_distillation_teacher_assets,
 )
 from instinct_mjlab.utils.motion_validation import (
-  find_default_tracking_motion_file,
-  resolve_datasets_root,
   validate_tracking_motion_file,
 )
 from instinct_mjlab.tasks.registry import (
@@ -69,6 +68,8 @@ class TrainConfig:
   video: bool = False
   video_length: int = 200
   video_interval: int = 2_000
+  viewer: Literal["none", "native"] = "none"
+  viewer_fps: float = 60.0
   gpu_ids: list[int] | Literal["all"] | None = None
 
   @staticmethod
@@ -80,7 +81,108 @@ class TrainConfig:
     )
 
 
-def _resolve_tracking_motion(task_id: str, cfg: TrainConfig) -> str | None:
+@dataclass
+class TrainCliConfig:
+  motion_file: str | None = None
+  registry_name: str | None = None
+  num_envs: int | None = None
+  device: str | None = None
+  video: bool = False
+  video_length: int = 200
+  video_interval: int = 2_000
+  viewer: Literal["none", "native"] = "none"
+  viewer_fps: float = 60.0
+  gpu_ids: list[int] | Literal["all"] | None = None
+
+
+def _parse_cli_literal(raw: str) -> Any:
+  lower = raw.lower()
+  if lower == "none":
+    return None
+  if lower == "true":
+    return True
+  if lower == "false":
+    return False
+  try:
+    return ast.literal_eval(raw)
+  except Exception:
+    return raw
+
+
+def _iter_dot_overrides(tokens: list[str]) -> list[tuple[str, Any]]:
+  overrides: list[tuple[str, Any]] = []
+  i = 0
+  while i < len(tokens):
+    token = tokens[i]
+    if not token.startswith("--"):
+      raise ValueError(f"Unexpected argument '{token}'. Dot-overrides must start with '--'.")
+
+    flag = token[2:]
+    if "=" in flag:
+      key, raw_value = flag.split("=", 1)
+      overrides.append((key, _parse_cli_literal(raw_value)))
+      i += 1
+      continue
+
+    if i + 1 >= len(tokens) or tokens[i + 1].startswith("--"):
+      overrides.append((flag, True))
+      i += 1
+      continue
+
+    overrides.append((flag, _parse_cli_literal(tokens[i + 1])))
+    i += 2
+  return overrides
+
+
+def _coerce_override_value(value: Any, current: Any) -> Any:
+  if isinstance(current, tuple) and isinstance(value, list):
+    return tuple(value)
+  if isinstance(current, list) and isinstance(value, tuple):
+    return list(value)
+  if isinstance(current, float) and isinstance(value, int):
+    return float(value)
+  return value
+
+
+def _set_nested_attr(target: Any, path: str, value: Any) -> None:
+  parts = path.split(".")
+  current = target
+  for part in parts[:-1]:
+    if isinstance(current, dict):
+      if part not in current:
+        raise ValueError(f"Unknown dict key '{part}' while applying override '{path}'.")
+      current = current[part]
+    else:
+      if not hasattr(current, part):
+        raise ValueError(f"Unknown attribute '{part}' while applying override '{path}'.")
+      current = getattr(current, part)
+
+  last = parts[-1]
+  if isinstance(current, dict):
+    if last not in current:
+      raise ValueError(f"Unknown dict key '{last}' while applying override '{path}'.")
+    current[last] = _coerce_override_value(value, current[last])
+    return
+
+  if not hasattr(current, last):
+    raise ValueError(f"Unknown attribute '{last}' while applying override '{path}'.")
+  existing = getattr(current, last)
+  setattr(current, last, _coerce_override_value(value, existing))
+
+
+def _apply_dot_overrides(cfg: TrainConfig, raw_args: list[str]) -> None:
+  for key, value in _iter_dot_overrides(raw_args):
+    if key.startswith("agent."):
+      _set_nested_attr(cfg.agent, key[len("agent."):], value)
+    elif key.startswith("env."):
+      _set_nested_attr(cfg.env, key[len("env."):], value)
+    else:
+      raise ValueError(
+        f"Unsupported override '{key}'. Use top-level flags or '--agent.*' / '--env.*'."
+      )
+
+
+def _resolve_tracking_motion(_task_id: str, cfg: TrainConfig) -> str | None:
   is_tracking_task = "motion" in cfg.env.commands and isinstance(
     cfg.env.commands["motion"], MotionCommandCfg
   )
@@ -112,26 +214,14 @@ def _resolve_tracking_motion(task_id: str, cfg: TrainConfig) -> str | None:
   configured_motion = str(getattr(motion_cmd, "motion_file", "")).strip()
   if configured_motion:
     configured_path = Path(configured_motion).expanduser().resolve()
-    try:
-      validate_tracking_motion_file(configured_path)
-    except (ValueError, OSError, FileNotFoundError):
-      pass
-    else:
-      motion_cmd.motion_file = str(configured_path)
-      print(f"[INFO] Using motion file from env config: {configured_path}")
-      return None
-
-  default_motion = find_default_tracking_motion_file(task_id)
-  if default_motion is not None:
-    motion_cmd.motion_file = str(default_motion)
-    print(f"[INFO] Auto-selected motion file: {default_motion}")
+    validate_tracking_motion_file(configured_path)
+    motion_cmd.motion_file = str(configured_path)
+    print(f"[INFO] Using motion file from env config: {configured_path}")
     return None
 
   raise ValueError(
-    "Tracking 任务必须提供 motion 数据：\n"
-    "  --motion-file /path/to/motion.npz\n"
-    "  或 --registry-name your-org/motions/motion-name\n"
-    f"当前默认搜索目录: {resolve_datasets_root()} （可用 INSTINCT_DATASETS_ROOT 覆盖）"
+    "Tracking training requires a motion file.\n"
+    "  --motion-file /path/to/motion.npz"
   )
 
 
@@ -148,13 +238,24 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       "  pip install -e ../mjlab\n"
       "  pip install -e ../instinct_rl"
     )
-  os.environ.setdefault("MUJOCO_GL", "egl")
+  if cfg.viewer == "native":
+    os.environ["MUJOCO_GL"] = "glfw"
+  else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
+  if cfg.viewer == "native":
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if not has_display:
+      raise RuntimeError(
+        "Native viewer requires DISPLAY/WAYLAND_DISPLAY. "
+        "Unset --viewer or use an X/Wayland session."
+      )
   configure_torch_backends()
 
   device = _resolve_device(cfg)
   if device.startswith("cpu"):
     raise ValueError(
-      "instinct_rl 当前训练链路依赖 CUDA 统计接口，请使用 GPU 设备，例如 --device cuda:0。"
+      "The current instinct_rl training pipeline requires CUDA runtime stats. "
+      "Use a GPU device, e.g. `--device cuda:0`."
     )
   cfg.agent.device = device
   cfg.env.seed = cfg.agent.seed
@@ -187,6 +288,25 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     policy_group=cfg.agent.policy_observation_group,
     critic_group=cfg.agent.critic_observation_group,
   )
+
+  train_viewer = None
+  if cfg.viewer == "native":
+    from mjlab.viewer import NativeMujocoViewer
+
+    def _viewer_policy(_obs: torch.Tensor) -> torch.Tensor:
+      return torch.zeros(
+        (vec_env.num_envs, vec_env.num_actions),
+        device=vec_env.device,
+      )
+
+    train_viewer = NativeMujocoViewer(
+      vec_env,
+      policy=_viewer_policy,
+      frame_rate=cfg.viewer_fps,
+    )
+    train_viewer.setup()
+    train_viewer.sync_env_to_viewer()
+    print("[INFO] Native viewer enabled during training.")
 
   runner_cls = load_runner_cls(task_id) or OnPolicyRunner
   agent_cfg_dict = asdict(cfg.agent)
@@ -241,12 +361,27 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       log_dir / "params" / "registry.yaml",
       {"registry_name": registry_name},
     )
+  if train_viewer is not None:
+    runner_rollout_step = runner.rollout_step
 
-  runner.learn(
-    num_learning_iterations=cfg.agent.max_iterations,
-    init_at_random_ep_len=True,
-  )
-  vec_env.close()
+    def _rollout_step_with_view(obs, critic_obs):
+      result = runner_rollout_step(obs, critic_obs)
+      if train_viewer.is_running():
+        train_viewer.sync_viewer_to_env()
+        train_viewer.sync_env_to_viewer()
+      return result
+
+    runner.rollout_step = _rollout_step_with_view
+
+  try:
+    runner.learn(
+      num_learning_iterations=cfg.agent.max_iterations,
+      init_at_random_ep_len=True,
+    )
+  finally:
+    if train_viewer is not None:
+      train_viewer.close()
+    vec_env.close()
 
 
 def launch_training(task_id: str, args: TrainConfig | None = None) -> None:
@@ -268,13 +403,29 @@ def main() -> None:
     config=mjlab.TYRO_FLAGS,
   )
 
-  args = tyro.cli(
-    TrainConfig,
+  cli_cfg, dot_override_args = tyro.cli(
+    TrainCliConfig,
     args=remaining_args,
-    default=TrainConfig.from_task(chosen_task),
+    default=TrainCliConfig(),
+    return_unknown_args=True,
     prog=sys.argv[0] + f" {chosen_task}",
     config=mjlab.TYRO_FLAGS,
   )
+
+  args = replace(
+    TrainConfig.from_task(chosen_task),
+    motion_file=cli_cfg.motion_file,
+    registry_name=cli_cfg.registry_name,
+    num_envs=cli_cfg.num_envs,
+    device=cli_cfg.device,
+    video=cli_cfg.video,
+    video_length=cli_cfg.video_length,
+    video_interval=cli_cfg.video_interval,
+    viewer=cli_cfg.viewer,
+    viewer_fps=cli_cfg.viewer_fps,
+    gpu_ids=cli_cfg.gpu_ids,
+  )
+  _apply_dot_overrides(args, dot_override_args)
   launch_training(task_id=chosen_task, args=args)
 
 

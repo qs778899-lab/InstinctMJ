@@ -80,10 +80,11 @@ class TorqueMonitorSensor(MonitorSensor):
         # set access to the articulation we want to monitor
         self._asset = self._env.scene[self.cfg.entity_name]
         # set the buffer
+        # mjlab uses actuator_force instead of applied_torque
         self._torque_buffer = torch.zeros(
             self._env.num_envs,
             self.cfg.history_length,
-            self._asset.data.applied_torque.shape[-1],
+            self._asset.data.actuator_force.shape[-1],
             dtype=torch.float32,
             device=self.device,
         )
@@ -92,7 +93,8 @@ class TorqueMonitorSensor(MonitorSensor):
 
     def _update_buffers_impl(self):
         all_env_ids = torch.arange(self._env.num_envs, dtype=torch.long, device=self.device)
-        self._torque_buffer[all_env_ids, self._step_idx, :] = self._asset.data.applied_torque
+        # mjlab uses actuator_force instead of applied_torque
+        self._torque_buffer[all_env_ids, self._step_idx, :] = self._asset.data.actuator_force
 
 
 class JointStatMonitorTerm(MonitorTerm):
@@ -223,8 +225,10 @@ class ActuatorMonitorTerm(MonitorTerm):
     def update(self, dt: float):
         """Update the monitor term."""
         self._joint_pos_cmd[:] = self.asset.data.joint_pos_target[:, self.asset_joint_ids].mean(dim=-1)
-        self._applied_torque[:] = self.asset.data.applied_torque[:, self.asset_joint_ids].mean(dim=-1)
-        self._computed_torque[:] = self.asset.data.computed_torque[:, self.asset_joint_ids].mean(dim=-1)
+        # mjlab uses actuator_force instead of applied_torque and doesn't expose computed_torque
+        self._applied_torque[:] = self.asset.data.actuator_force[:, self.asset_joint_ids].mean(dim=-1)
+        # computed_torque is not available in mjlab, set to zero
+        self._computed_torque[:] = 0.0
         self._joint_pos_skeleton[:] = self.asset.data.joint_pos[:, self.asset_joint_ids].mean(dim=-1)
         self._joint_vel[:] = self.asset.data.joint_vel[:, self.asset_joint_ids].mean(dim=-1)
         self._joint_power[:] = (self._applied_torque * self._joint_vel).mean(dim=-1)

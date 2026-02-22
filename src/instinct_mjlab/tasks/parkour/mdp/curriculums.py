@@ -8,12 +8,12 @@ from mjlab.managers import SceneEntityCfg
 from instinct_mjlab.terrains import TerrainImporter
 
 if TYPE_CHECKING:
-    from mjlab.entity import Entity as Articulation
-    from mjlab.envs import ManagerBasedRlEnv as ManagerBasedRLEnv
+    from mjlab.entity import Entity
+    from mjlab.envs import ManagerBasedRlEnv
 
 
 def tracking_exp_vel(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedRlEnv,
     env_ids: Sequence[int],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     lin_vel_threshold: tuple = (0.3, 0.6),
@@ -39,7 +39,7 @@ def tracking_exp_vel(
         The mean terrain level for the given environment ids.
     """
     # extract the used quantities (to enable type-hinting)
-    asset: Articulation = env.scene[asset_cfg.name]
+    asset: Entity = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
     command = env.command_manager.get_term("base_velocity")
     tracking_exp_vel_xy = command.metrics["tracking_exp_vel_xy"][env_ids]

@@ -11,20 +11,70 @@ if TYPE_CHECKING:
     from typing import Callable
 
 
+def _build_ort_providers() -> list[str]:
+    """Prefer CUDA/CPU providers and skip TensorRT probing noise."""
+    available = set(ort.get_available_providers())
+    providers: list[str] = []
+    if "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+    # Fallback to whatever ORT reports if neither CUDA nor CPU is visible.
+    return providers if providers else list(ort.get_available_providers())
+
+
+def _run_onnx_with_batch_support(
+    session: ort.InferenceSession, input_name: str, batched_input: np.ndarray
+) -> np.ndarray:
+    """Run ONNX with fallback for models exported with fixed batch size = 1."""
+    expected_batch = session.get_inputs()[0].shape[0]
+    if isinstance(expected_batch, int) and expected_batch > 0 and batched_input.shape[0] != expected_batch:
+        if expected_batch != 1:
+            raise ValueError(
+                f"ONNX model expects fixed batch={expected_batch}, but got batch={batched_input.shape[0]}."
+            )
+        outputs = [session.run(None, {input_name: batched_input[i : i + 1]})[0] for i in range(batched_input.shape[0])]
+        return np.concatenate(outputs, axis=0)
+    return session.run(None, {input_name: batched_input})[0]
+
+
+def _validate_spatial_shape(session: ort.InferenceSession, depth_image_input: np.ndarray) -> None:
+    """Validate H/W to surface a clear mismatch message before ORT raises."""
+    input_shape = session.get_inputs()[0].shape
+    if len(input_shape) < 4:
+        return
+    expected_h = input_shape[-2]
+    expected_w = input_shape[-1]
+    got_h = depth_image_input.shape[-2]
+    got_w = depth_image_input.shape[-1]
+    if isinstance(expected_h, int) and expected_h > 0 and got_h != expected_h:
+        raise ValueError(
+            f"Depth height mismatch for ONNX encoder: expected {expected_h}, got {got_h}. "
+            "Please use a matching ONNX model or align parkour depth observation output size."
+        )
+    if isinstance(expected_w, int) and expected_w > 0 and got_w != expected_w:
+        raise ValueError(
+            f"Depth width mismatch for ONNX encoder: expected {expected_w}, got {got_w}. "
+            "Please use a matching ONNX model or align parkour depth observation output size."
+        )
+
+
 def load_parkour_onnx_model(
     model_dir: str, get_subobs_func: Callable, depth_shape: tuple, proprio_slice: slice
 ) -> Callable:
     """Load the ONNX model as policy, but only for parkour task setting."""
-    ort_providers = ort.get_available_providers()
+    ort_providers = _build_ort_providers()
     encoder = ort.InferenceSession(os.path.join(model_dir, "0-depth_encoder.onnx"), providers=ort_providers)
     actor = ort.InferenceSession(os.path.join(model_dir, "actor.onnx"), providers=ort_providers)
+    encoder_input_name = encoder.get_inputs()[0].name
     actor_input_name = actor.get_inputs()[0].name
 
     def policy(obs: torch.Tensor) -> torch.Tensor:
         depth_image_input = get_subobs_func(obs)
         depth_image_input = depth_image_input.cpu().numpy()
         depth_image_input = depth_image_input.reshape((-1, *depth_shape))
-        depth_image_output = encoder.run(None, {encoder.get_inputs()[0].name: depth_image_input})[0]
+        _validate_spatial_shape(encoder, depth_image_input)
+        depth_image_output = _run_onnx_with_batch_support(encoder, encoder_input_name, depth_image_input)
         actor_input = np.concatenate(
             [
                 obs.cpu().numpy()[:, proprio_slice],
@@ -32,7 +82,7 @@ def load_parkour_onnx_model(
             ],
             axis=1,
         )
-        actor_output = actor.run(None, {actor_input_name: actor_input})[0]
+        actor_output = _run_onnx_with_batch_support(actor, actor_input_name, actor_input)
         return torch.from_numpy(actor_output).to(obs.device)
 
     return policy

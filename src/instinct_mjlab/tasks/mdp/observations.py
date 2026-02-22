@@ -8,7 +8,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 
-from mjlab.managers import ManagerTermBase
+from mjlab.managers import ManagerTermBase, SceneEntityCfg
 from mjlab.sensor import CameraSensor, PinholeCameraPatternCfg, RayCastSensor
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.tasks.tracking.mdp.observations import (
@@ -274,62 +274,91 @@ def perceptive_link_rot_b(env, command_name: str = "motion") -> torch.Tensor:
 
 def parkour_amp_reference_projected_gravity(
   env,
-  command_name: str = "motion",
+  asset_cfg=None,
 ) -> torch.Tensor:
-  """Projected gravity in reference-anchor frame for AMP reference states."""
-  command = _resolve_motion_command(env, command_name=command_name)
+  """Projected gravity in the motion-reference base frame for AMP reference states."""
+  motion_reference = env.scene[
+    "motion_reference" if asset_cfg is None else asset_cfg.name
+  ]
+  base_quat_w = motion_reference.reference_frame.base_quat_w[:, 0]
   gravity_w = torch.zeros(
-    command.anchor_quat_w.shape[0],
+    base_quat_w.shape[0],
     3,
-    device=command.anchor_quat_w.device,
-    dtype=command.anchor_quat_w.dtype,
+    device=base_quat_w.device,
+    dtype=base_quat_w.dtype,
   )
   gravity_w[:, 2] = -1.0
-  return quat_apply_inverse(command.anchor_quat_w, gravity_w)
+  return quat_apply_inverse(base_quat_w, gravity_w)
 
 
 def parkour_amp_reference_joint_pos_rel(
   env,
-  command_name: str = "motion",
+  asset_cfg: SceneEntityCfg | None = None,
   robot_name: str = "robot",
 ) -> torch.Tensor:
-  """Reference joint position relative to robot default joint positions."""
-  command = _resolve_motion_command(env, command_name=command_name)
+  """Reference joint positions relative to robot default joint positions."""
+  motion_reference = env.scene[
+    "motion_reference" if asset_cfg is None else asset_cfg.name
+  ]
+  joint_ids = slice(None) if asset_cfg is None else asset_cfg.joint_ids
   robot = env.scene[robot_name]
   default_joint_pos = robot.data.default_joint_pos
   assert default_joint_pos is not None
-  return command.joint_pos - default_joint_pos
+  reference_joint_pos = motion_reference.reference_frame.joint_pos[:, 0, joint_ids]
+  reference_joint_pos_mask = motion_reference.reference_frame.joint_pos_mask[
+    :, 0, joint_ids
+  ]
+  return (
+    reference_joint_pos - default_joint_pos[:, joint_ids]
+  ) * reference_joint_pos_mask
 
 
 def parkour_amp_reference_joint_vel_rel(
   env,
-  command_name: str = "motion",
+  asset_cfg: SceneEntityCfg | None = None,
   robot_name: str = "robot",
 ) -> torch.Tensor:
-  """Reference joint velocity relative to robot default joint velocities."""
-  command = _resolve_motion_command(env, command_name=command_name)
+  """Reference joint velocities relative to robot default joint velocities."""
+  motion_reference = env.scene[
+    "motion_reference" if asset_cfg is None else asset_cfg.name
+  ]
+  joint_ids = slice(None) if asset_cfg is None else asset_cfg.joint_ids
   robot = env.scene[robot_name]
   default_joint_vel = robot.data.default_joint_vel
   assert default_joint_vel is not None
-  return command.joint_vel - default_joint_vel
+  reference_joint_vel = motion_reference.reference_frame.joint_vel[:, 0, joint_ids]
+  reference_joint_vel_mask = motion_reference.reference_frame.joint_vel_mask[
+    :, 0, joint_ids
+  ]
+  return (
+    reference_joint_vel - default_joint_vel[:, joint_ids]
+  ) * reference_joint_vel_mask
 
 
 def parkour_amp_reference_base_lin_vel(
   env,
-  command_name: str = "motion",
+  asset_cfg=None,
 ) -> torch.Tensor:
-  """Reference anchor linear velocity in reference-anchor frame."""
-  command = _resolve_motion_command(env, command_name=command_name)
-  return quat_apply_inverse(command.anchor_quat_w, command.anchor_lin_vel_w)
+  """Reference base linear velocity in the motion-reference base frame."""
+  motion_reference = env.scene[
+    "motion_reference" if asset_cfg is None else asset_cfg.name
+  ]
+  base_quat_w = motion_reference.reference_frame.base_quat_w[:, 0]
+  base_lin_vel_w = motion_reference.reference_frame.base_lin_vel_w[:, 0]
+  return quat_apply_inverse(base_quat_w, base_lin_vel_w)
 
 
 def parkour_amp_reference_base_ang_vel(
   env,
-  command_name: str = "motion",
+  asset_cfg=None,
 ) -> torch.Tensor:
-  """Reference anchor angular velocity in reference-anchor frame."""
-  command = _resolve_motion_command(env, command_name=command_name)
-  return quat_apply_inverse(command.anchor_quat_w, command.anchor_ang_vel_w)
+  """Reference base angular velocity in the motion-reference base frame."""
+  motion_reference = env.scene[
+    "motion_reference" if asset_cfg is None else asset_cfg.name
+  ]
+  base_quat_w = motion_reference.reference_frame.base_quat_w[:, 0]
+  base_ang_vel_w = motion_reference.reference_frame.base_ang_vel_w[:, 0]
+  return quat_apply_inverse(base_quat_w, base_ang_vel_w)
 
 
 class _PerceptiveRaycastNoisedBase(ManagerTermBase):

@@ -51,8 +51,8 @@ class EdgeCylinderCfg(VirtualObstacleCfg):
             prim_path="/Visuals/edgeMarkers",
             markers={
                 "cylinder": _CylinderMarkerCfg(
-                    radius=1,
-                    height=1,
+                    radius=1.0,
+                    height=1.0,
                     visual_material=_PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.9), opacity=0.2),
                 )
             },
@@ -170,8 +170,8 @@ class RayEdgeCylinderCfg(VirtualObstacleCfg):
             prim_path="/Visuals/edgeMarkers",
             markers={
                 "cylinder": _CylinderMarkerCfg(
-                    radius=1,
-                    height=1,
+                    radius=1.0,
+                    height=1.0,
                     visual_material=_PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.9), opacity=0.2),
                 )
             },

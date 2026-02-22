@@ -62,12 +62,12 @@ python scripts/instinct_rl/train.py --headless --task=Instinct-Perceptive-Shadow
 3. Play trained policy (load_run must be provided, absolute path is recommended, or use `--no_resume` to visualize untrained policy):
 ```bash
 # PPO version
-python source/instinct_mjlab/instinct_mjlab/tasks/shadowing/play.py --task=Instinct-Perceptive-Shadowing-G1-v0 --load_run=<run_name>
+python -m instinct_mjlab.scripts.instinct_rl.play Instinct-Perceptive-Shadowing-G1-v0 --load-run=<run_name>
 ```
 
 ## Common Options
 
 - `--num_envs`: Number of parallel environments (default varies by task)
 - `--max_iterations`: Training iterations (default varies by task)
-- `--load_run`: Run name to load checkpoint from for playing
+- `--load-run`: Run name to load checkpoint from for playing
 - `--video`: Record training/playback videos

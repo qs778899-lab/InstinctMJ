@@ -4,7 +4,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import numpy as np
 import os
-from scipy import interpolate
 import scipy.spatial.transform as tf
 import torch
 import trimesh
@@ -24,6 +23,11 @@ _COACD_PARTS_CACHE: dict[tuple, list[tuple[np.ndarray, np.ndarray]]] = {}
 _COACD_PREWARM_DONE: set[tuple] = set()
 _COACD_CACHE_VERSION = 2
 _COACD_LOG_LEVEL_SET: str | None = None
+
+# In-memory cache for hfield height arrays keyed by (abspath, st_size, st_mtime_ns, resolution, size_x, size_y).
+# Avoids re-running ray-casting when the same STL is used across multiple terrain tiles.
+_HFIELD_HEIGHT_CACHE: dict[tuple, np.ndarray] = {}
+_HFIELD_CACHE_VERSION = 4
 
 import mujoco
 
@@ -695,13 +699,135 @@ def _add_collision_coacd(
     return geometries
 
 
+def _hfield_cache_key(
+    terrain_abspath: str,
+    resolution: float,
+    size: tuple[float, float],
+) -> tuple:
+    """Build a stable cache key for hfield ray-cast results."""
+    terrain_abspath = os.path.abspath(terrain_abspath)
+    stat_info = os.stat(terrain_abspath)
+    return (
+        _HFIELD_CACHE_VERSION,
+        terrain_abspath,
+        int(stat_info.st_size),
+        int(stat_info.st_mtime_ns),
+        float(resolution),
+        float(size[0]),
+        float(size[1]),
+    )
+
+
+def _hfield_disk_cache_path(
+    terrain_abspath: str,
+    cache_key: tuple,
+    cache_dirname: str,
+) -> str:
+    """Get disk-cache file path for hfield height array."""
+    terrain_abspath = os.path.abspath(terrain_abspath)
+    terrain_dir = os.path.dirname(terrain_abspath)
+    cache_dir = os.path.join(terrain_dir, cache_dirname)
+    key_hash = hashlib.sha1(repr(cache_key).encode("utf-8")).hexdigest()[:16]
+    terrain_stem = os.path.splitext(os.path.basename(terrain_abspath))[0]
+    return os.path.join(cache_dir, f"{terrain_stem}.hfield.{key_hash}.npz")
+
+
+def _raycast_rows_worker(
+    job: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Worker: ray-cast a subset of rows and return (ray_indices_local, hit_z)."""
+    import trimesh as _trimesh
+    vertices, faces, ray_origins_chunk, ray_directions_chunk, _mesh_z_min, _unused = job
+    mesh = _trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    ray_caster = _trimesh.ray.ray_triangle.RayMeshIntersector(mesh)
+    hit_points, ray_indices, _ = ray_caster.intersects_location(
+        ray_origins=ray_origins_chunk,
+        ray_directions=ray_directions_chunk,
+        multiple_hits=True,
+    )
+    if len(ray_indices) > 0:
+        return ray_indices, hit_points[:, 2]
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+
+def _raycast_hfield_parallel(
+    terrain_mesh: trimesh.Trimesh,
+    ray_origins: np.ndarray,
+    n_rays: int,
+    num_workers: int,
+) -> np.ndarray:
+    """Ray-cast all rays in parallel across CPU cores, return per-ray max-z array.
+
+    Grid points that miss the mesh entirely are returned as NaN so the caller
+    can distinguish them from valid hits and fill them appropriately.
+    """
+    # Initialise with NaN — rays that miss the mesh stay NaN.
+    height = np.full(n_rays, np.nan, dtype=np.float64)
+    ray_directions = np.tile(np.array([0.0, 0.0, -1.0]), (n_rays, 1))
+
+    vertices = np.asarray(terrain_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(terrain_mesh.faces, dtype=np.int32)
+
+    # Split rays into chunks — one chunk per worker.
+    chunk_size = max(1, (n_rays + num_workers - 1) // num_workers)
+    chunks = []
+    for start in range(0, n_rays, chunk_size):
+        end = min(start + chunk_size, n_rays)
+        chunks.append((
+            vertices,
+            faces,
+            ray_origins[start:end],
+            ray_directions[start:end],
+            0.0,  # unused
+            0.0,  # unused placeholder
+        ))
+
+    if num_workers == 1:
+        # Single-process path: avoid ProcessPoolExecutor overhead.
+        for chunk_start, chunk in zip(range(0, n_rays, chunk_size), chunks):
+            local_indices, hit_z = _raycast_rows_worker(chunk)
+            if len(local_indices) > 0:
+                global_indices = local_indices + chunk_start
+                # First hit: replace NaN with the z value.
+                nan_mask = np.isnan(height[global_indices])
+                height[global_indices[nan_mask]] = hit_z[nan_mask]
+                # Subsequent hits: keep the maximum (top surface).
+                np.maximum.at(height, global_indices[~nan_mask], hit_z[~nan_mask])
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = []
+            chunk_starts = list(range(0, n_rays, chunk_size))
+            for chunk in chunks:
+                futures.append(executor.submit(_raycast_rows_worker, chunk))
+            for chunk_start, future in zip(chunk_starts, futures):
+                local_indices, hit_z = future.result()
+                if len(local_indices) > 0:
+                    global_indices = local_indices + chunk_start
+                    nan_mask = np.isnan(height[global_indices])
+                    height[global_indices[nan_mask]] = hit_z[nan_mask]
+                    np.maximum.at(height, global_indices[~nan_mask], hit_z[~nan_mask])
+
+    return height
+
+
 def _add_collision_hfield_from_mesh(
     cfg: mesh_terrains_cfg.MotionMatchedTerrainCfg,
     spec: mujoco.MjSpec,
     terrain_mesh: trimesh.Trimesh,
     terrain_idx: int,
+    terrain_abspath: str | None = None,
 ) -> TerrainGeometry:
-    """Create a collision hfield from terrain mesh top-surface samples."""
+    """Create a collision hfield from terrain mesh by ray-casting from above at each grid point.
+
+    Each grid point fires a downward ray and records the highest intersection with the mesh.
+    This gives accurate height values even between mesh vertices, unlike vertex-sampling
+    + interpolation which can miss geometry between sparse vertices.
+    Grid points that miss the mesh entirely fall back to the mesh AABB minimum z.
+
+    Results are cached in memory and on disk (keyed by STL path + mtime + resolution + size)
+    so the same STL tile is only ray-cast once across terrain tiles and process restarts.
+    Ray-casting is parallelised across CPU cores via multiprocessing.
+    """
     resolution = float(cfg.collision_hfield_resolution)
     if resolution <= 0.0:
         raise ValueError("collision_hfield_resolution must be greater than zero.")
@@ -712,29 +838,98 @@ def _add_collision_hfield_from_mesh(
     y = np.linspace(0.0, cfg.size[1], ncol, dtype=np.float64)
     xx, yy = np.meshgrid(x, y, indexing="ij")
 
-    sample_xy, sample_z = _top_surface_samples(
-        terrain_mesh,
-        cfg.collision_hfield_normal_z_threshold,
-        resolution,
-    )
-    sample_xy = np.clip(sample_xy, a_min=(0.0, 0.0), a_max=(cfg.size[0], cfg.size[1]))
+    # Build ray origins above the mesh AABB and shoot downward.
+    mesh_z_max = float(terrain_mesh.bounds[1, 2])
+    mesh_z_min = float(terrain_mesh.bounds[0, 2])
+    ray_origin_z = mesh_z_max + 1.0
 
-    height = interpolate.griddata(
-        sample_xy,
-        sample_z,
-        (xx, yy),
-        method="linear",
-    )
-    nan_mask = np.isnan(height)
-    if np.any(nan_mask):
-        height[nan_mask] = interpolate.griddata(
-            sample_xy,
-            sample_z,
-            (xx[nan_mask], yy[nan_mask]),
-            method="nearest",
+    n_rays = nrow * ncol
+    ray_origins = np.column_stack([
+        xx.reshape(-1),
+        yy.reshape(-1),
+        np.full(n_rays, ray_origin_z, dtype=np.float64),
+    ])
+
+    # --- Cache lookup ---
+    cache_key: tuple | None = None
+    cache_path: str | None = None
+    if terrain_abspath is not None:
+        terrain_abspath = os.path.abspath(terrain_abspath)
+        cache_key = _hfield_cache_key(terrain_abspath, resolution, (cfg.size[0], cfg.size[1]))
+        cache_path = _hfield_disk_cache_path(
+            terrain_abspath, cache_key, str(cfg.collision_hfield_cache_dirname)
         )
-    height = np.nan_to_num(height, nan=0.0)
 
+    height: np.ndarray | None = None
+
+    # 1. In-memory cache hit.
+    if cache_key is not None:
+        height = _HFIELD_HEIGHT_CACHE.get(cache_key)
+
+    # 2. Disk cache hit.
+    if height is None and cache_key is not None and cfg.collision_hfield_use_disk_cache and os.path.exists(cache_path):
+        try:
+            with np.load(cache_path, allow_pickle=False) as npz:
+                loaded = np.asarray(npz["height"], dtype=np.float64)
+                if loaded.shape == (nrow, ncol):
+                    height = loaded
+                    _HFIELD_HEIGHT_CACHE[cache_key] = height
+        except (OSError, ValueError, KeyError) as exc:
+            print(
+                f"[TerrainImporter] hfield disk cache load failed, recomputing: "
+                f"{cache_path}, error={exc}"
+            )
+
+    # 3. Compute via parallel ray-casting.
+    if height is None:
+        num_workers = int(cfg.collision_hfield_num_workers)
+        if num_workers <= 0:
+            num_workers = max(os.cpu_count() or 1, 1)
+
+        raw = _raycast_hfield_parallel(
+            terrain_mesh=terrain_mesh,
+            ray_origins=ray_origins,
+            n_rays=n_rays,
+            num_workers=num_workers,
+        ).reshape(nrow, ncol)
+
+        # Grid points that missed the mesh entirely are NaN.
+        # MuJoCo hfield is a solid rectangular block — there is no way to create a "hole".
+        # To prevent miss-area cells from producing spurious contacts, we sink them far
+        # below the real terrain by subtracting a large depth offset.  This makes their
+        # normalized_height ≈ 0, which maps to the hfield bottom plate deep underground.
+        # The real terrain cells keep their hit z values and align correctly with the mesh.
+        hit_mask = ~np.isnan(raw)
+        if np.any(hit_mask):
+            hit_z_min = float(np.min(raw[hit_mask]))
+            hit_z_max = float(np.max(raw[hit_mask]))
+        else:
+            hit_z_min = mesh_z_min
+            hit_z_max = mesh_z_min
+        # Sink miss cells 10× the terrain height range below the terrain floor.
+        terrain_height_range = max(hit_z_max - hit_z_min, 1.0)
+        sink_depth = terrain_height_range * 10.0
+        height = np.where(hit_mask, raw, hit_z_min - sink_depth)
+
+        # Store in memory cache.
+        if cache_key is not None:
+            _HFIELD_HEIGHT_CACHE[cache_key] = height
+
+        # Store on disk cache.
+        if cache_key is not None and cfg.collision_hfield_use_disk_cache and cache_path is not None:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp_path = f"{cache_path}.{uuid.uuid4().hex}.tmp.npz"
+            try:
+                np.savez_compressed(tmp_path, height=height.astype(np.float32))
+                os.replace(tmp_path, cache_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    # elevation_min includes the sunken miss cells; elevation_max is the true terrain top.
+    # normalized_height maps [elevation_min .. elevation_max] -> [0 .. 1].
+    # Miss cells get normalized_height ≈ 0 (deep underground); hit cells span the upper
+    # portion of the [0..1] range and align correctly with the visual mesh.
     elevation_min = float(np.min(height))
     elevation_max = float(np.max(height))
     elevation_range = max(elevation_max - elevation_min, 1.0e-6)
@@ -757,12 +952,21 @@ def _add_collision_hfield_from_mesh(
         ncol=ncol,
         userdata=normalized_height.astype(np.float32).reshape(-1).tolist(),
     )
+    # hfield pos is its bottom-centre in the terrain body frame.
+    # MuJoCo hfield: the surface at normalized_height h sits at
+    #   pos.z + base_thickness + h * elevation_range
+    # We want the hit cells (normalized near 1) to align with the visual mesh.
+    # hit_z_max corresponds to normalized_height = (hit_z_max - elevation_min) / elevation_range.
+    # The actual world z of the top surface = pos.z + base_thickness + elevation_range.
+    # We need: pos.z + base_thickness + elevation_range = elevation_max
+    # => pos.z = elevation_max - base_thickness - elevation_range = elevation_min - base_thickness
     hfield_geom = spec.body("terrain").add_geom(
         type=mujoco.mjtGeom.mjGEOM_HFIELD,
         hfieldname=hfield_name,
         pos=(cfg.size[0] / 2, cfg.size[1] / 2, elevation_min - base_thickness),
     )
-    hfield_geom.group = 1
+    # group=3: invisible in all default render groups; collision is still active.
+    hfield_geom.group = 3
     hfield_geom.rgba[:] = (0.0, 0.0, 0.0, 0.0)
     return TerrainGeometry(geom=hfield_geom, hfield=hfield)
 
@@ -860,7 +1064,7 @@ def motion_matched_terrain(
         geom.conaffinity = 0
         geom.group = 2
         geometries.append(
-            _add_collision_hfield_from_mesh(cfg, spec, terrain_mesh, terrain_idx)
+            _add_collision_hfield_from_mesh(cfg, spec, terrain_mesh, terrain_idx, terrain_abspath)
         )
     return TerrainOutput(origin=origin, geometries=geometries)
 

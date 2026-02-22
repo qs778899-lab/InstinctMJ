@@ -37,10 +37,17 @@ def motors_power_square(
     normalize_by_num_joints: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
-    power_j = asset.data.applied_torque * asset.data.joint_vel  # (batch_size, num_joints)
+    # mjlab uses actuator_force instead of applied_torque
+    power_j = asset.data.actuator_force * asset.data.joint_vel  # (batch_size, num_joints)
     if normalize_by_stiffness:
-        for _, actuator in asset.actuators.items():
-            power_j[:, actuator.joint_indices] /= actuator.stiffness
+        # mjlab: asset.actuators is a list, not a dict
+        for actuator in asset.actuators:
+            # Handle DelayedActuator wrapper - access base actuator properties
+            base_actuator = getattr(actuator, 'base_actuator', actuator)
+            target_ids = base_actuator.target_ids
+            stiffness = getattr(base_actuator, 'stiffness', None)
+            if stiffness is not None:
+                power_j[:, target_ids] /= stiffness
     power_j = power_j[:, asset_cfg.joint_ids]  # (batch_size, num_selected_joints)
     power = torch.sum(torch.square(power_j), dim=-1)  # (batch_size,)
     if normalize_by_num_joints:
@@ -258,7 +265,8 @@ class joint_torque_sign_switch(ManagerTermBase):
         super().__init__(cfg, env)
         self.asset_cfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
         self.asset = env.scene[self.asset_cfg.name]
-        self._last_joint_torque = torch.zeros_like(self.asset.data.applied_torque[:, self.asset_cfg.joint_ids])
+        # mjlab uses actuator_force instead of applied_torque
+        self._last_joint_torque = torch.zeros_like(self.asset.data.actuator_force[:, self.asset_cfg.joint_ids])
 
     def __call__(
         self,
@@ -266,7 +274,8 @@ class joint_torque_sign_switch(ManagerTermBase):
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         normalize_by_num_joints: bool = False,
     ):
-        joint_torque = self.asset.data.applied_torque[:, asset_cfg.joint_ids]
+        # mjlab uses actuator_force instead of applied_torque
+        joint_torque = self.asset.data.actuator_force[:, asset_cfg.joint_ids]
         joint_torque_sign_switch = torch.clip(torch.sign(joint_torque) * torch.sign(-self._last_joint_torque), min=0.0)
 
         joint_torque_sign_switch_err = torch.sum(joint_torque_sign_switch, dim=-1)  # (batch_size,)
@@ -291,8 +300,14 @@ def joint_torques_l2(
     torques = torch.abs(asset.data.actuator_force)
 
     if normalize_by_stiffness:
-        for _, actuator in asset.actuators.items():
-            torques[:, actuator.joint_indices] /= actuator.stiffness
+        # mjlab: asset.actuators is a list, not a dict
+        for actuator in asset.actuators:
+            # Handle DelayedActuator wrapper - access base actuator properties
+            base_actuator = getattr(actuator, 'base_actuator', actuator)
+            target_ids = base_actuator.target_ids
+            stiffness = getattr(base_actuator, 'stiffness', None)
+            if stiffness is not None:
+                torques[:, target_ids] /= stiffness
     torques = torques[:, asset_cfg.joint_ids]
 
     torques = torch.sum(torch.square(torques), dim=-1)
@@ -313,11 +328,18 @@ def joint_torques_gauss(
     normalize_by_num_joints: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
-    torques = torch.abs(asset.data.applied_torque)
+    # mjlab uses actuator_force instead of applied_torque
+    torques = torch.abs(asset.data.actuator_force)
 
     if normalize_by_stiffness:
-        for _, actuator in asset.actuators.items():
-            torques[:, actuator.joint_indices] /= actuator.stiffness
+        # mjlab: asset.actuators is a list, not a dict
+        for actuator in asset.actuators:
+            # Handle DelayedActuator wrapper - access base actuator properties
+            base_actuator = getattr(actuator, 'base_actuator', actuator)
+            target_ids = base_actuator.target_ids
+            stiffness = getattr(base_actuator, 'stiffness', None)
+            if stiffness is not None:
+                torques[:, target_ids] /= stiffness
     torques = torques[:, asset_cfg.joint_ids]
 
     if torlerance > 0:
@@ -346,9 +368,10 @@ class joint_torques_direction_switch(ManagerTermBase):
         super().__init__(cfg, env)
         self.asset_cfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
         self.asset = env.scene[self.asset_cfg.name]
-        self._last_torque_direction = torch.sign(self.asset.data.applied_torque[:, self.asset_cfg.joint_ids])
+        # mjlab uses actuator_force instead of applied_torque
+        self._last_torque_direction = torch.sign(self.asset.data.actuator_force[:, self.asset_cfg.joint_ids])
         self._torque_direction_switch_count = torch.zeros_like(
-            self.asset.data.applied_torque[:, self.asset_cfg.joint_ids], dtype=torch.float
+            self.asset.data.actuator_force[:, self.asset_cfg.joint_ids], dtype=torch.float
         )  # (batch_size, num_joints)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
@@ -366,7 +389,8 @@ class joint_torques_direction_switch(ManagerTermBase):
         Args:
             mask: If True, the error will be masked by the current direction switch mask
         """
-        joint_torque = self.asset.data.applied_torque[:, self.asset_cfg.joint_ids]
+        # mjlab uses actuator_force instead of applied_torque
+        joint_torque = self.asset.data.actuator_force[:, self.asset_cfg.joint_ids]
         joint_torque_direction = torch.sign(joint_torque)
         direction_switch = joint_torque_direction != self._last_torque_direction
 
@@ -711,12 +735,18 @@ def applied_torque_limits_gauss(
 ):
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    # compute out of limits constraints
-    # TODO: We need to fix this to support implicit joints.
-    out_of_limits = torch.abs(asset.data.applied_torque - asset.data.computed_torque)
+    # mjlab uses actuator_force and doesn't expose computed_torque
+    # We penalize the absolute actuator force directly
+    out_of_limits = torch.abs(asset.data.actuator_force)
     if normalize_by_stiffness:
-        for _, actuator in asset.actuators.items():
-            out_of_limits[:, actuator.joint_indices] /= actuator.stiffness
+        # mjlab: asset.actuators is a list, not a dict
+        for actuator in asset.actuators:
+            # Handle DelayedActuator wrapper - access base actuator properties
+            base_actuator = getattr(actuator, 'base_actuator', actuator)
+            target_ids = base_actuator.target_ids
+            stiffness = getattr(base_actuator, 'stiffness', None)
+            if stiffness is not None:
+                out_of_limits[:, target_ids] /= stiffness
     out_of_limits = out_of_limits[:, asset_cfg.joint_ids]  # (batch_size, num_selected_joints)
 
     out_of_limits_err = torch.square(out_of_limits)
@@ -743,10 +773,18 @@ def applied_torque_limits_square(
     normalize_by_num_joints: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
-    out_of_limits = torch.abs(asset.data.applied_torque - asset.data.computed_torque)
+    # mjlab uses actuator_force and doesn't expose computed_torque
+    # We penalize the absolute actuator force directly
+    out_of_limits = torch.abs(asset.data.actuator_force)
     if normalize_by_stiffness:
-        for _, actuator in asset.actuators.items():
-            out_of_limits[:, actuator.joint_indices] /= actuator.stiffness
+        # mjlab: asset.actuators is a list, not a dict
+        for actuator in asset.actuators:
+            # Handle DelayedActuator wrapper - access base actuator properties
+            base_actuator = getattr(actuator, 'base_actuator', actuator)
+            target_ids = base_actuator.target_ids
+            stiffness = getattr(base_actuator, 'stiffness', None)
+            if stiffness is not None:
+                out_of_limits[:, target_ids] /= stiffness
     out_of_limits = out_of_limits[:, asset_cfg.joint_ids]  # (batch_size, num_selected_joints)
 
     out_of_limits_err = torch.sum(torch.square(out_of_limits), dim=-1)  # (batch_size,)

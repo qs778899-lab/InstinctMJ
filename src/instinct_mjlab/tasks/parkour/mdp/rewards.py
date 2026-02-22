@@ -106,27 +106,17 @@ def feet_air_time(
   env: ManagerBasedRlEnv,
   command_name: str,
   vel_threshold: float,
-  sensor_cfg: SceneEntityCfg | None = None,
-  sensor_name: str | None = None,
+  sensor_name: str,
 ) -> torch.Tensor:
   """Reward long steps taken by the feet for bipeds.
 
   Mirrors the original InstinctLab ``feet_air_time``.
   """
-  if sensor_name is None:
-    if sensor_cfg is None:
-      raise ValueError("Either sensor_name or sensor_cfg must be provided.")
-    sensor_name = sensor_cfg.name
-
   contact_sensor: ContactSensor = env.scene[sensor_name]
   air_time = contact_sensor.data.current_air_time
   contact_time = contact_sensor.data.current_contact_time
-  if air_time is None or contact_time is None:
-    raise ValueError(f"Sensor '{sensor_name}' must enable track_air_time for feet_air_time reward.")
-
-  if sensor_cfg is not None:
-    air_time = air_time[:, sensor_cfg.body_ids]
-    contact_time = contact_time[:, sensor_cfg.body_ids]
+  assert air_time is not None
+  assert contact_time is not None
 
   in_contact = contact_time > 0.0
   in_mode_time = torch.where(in_contact, contact_time, air_time)
@@ -153,40 +143,21 @@ def feet_slide(
   Mirrors the original InstinctLab ``contact_slide``.
   ``threshold`` is the contact force threshold (Newtons) — matches the
   original semantics where ``net_forces_w_history.norm() > threshold``
-  determines contact.  In mjlab, ``sensor.data.force`` is used when
-  available; otherwise falls back to ``sensor.data.found``.
+  determines contact.
   """
   asset: Entity = env.scene[asset_cfg.name]
   sensor: ContactSensor = env.scene[sensor_name]
 
-  # Contact detection — mjlab adaptation of original net_forces_w_history
-  # Original: contacts = net_forces_w_history[...].norm().max(dim=1)[0] > threshold
-  if sensor.data.force is not None:
-    in_contact = torch.linalg.vector_norm(sensor.data.force, dim=-1) > threshold
-  elif sensor.data.found is not None:
-    found = sensor.data.found
-    if found.ndim == 3:
-      in_contact = torch.any(found > 0, dim=-1)
-    else:
-      in_contact = found > 0
+  # Original: contacts = net_forces_w_history[...].norm(dim=-1).max(dim=1)[0] > threshold
+  force_history = sensor.data.force_history
+  if force_history is not None:
+    in_contact = torch.max(torch.linalg.vector_norm(force_history, dim=-1), dim=2)[0] > threshold
   else:
-    return torch.zeros(env.num_envs, device=env.device)
+    force = sensor.data.force
+    assert force is not None
+    in_contact = torch.linalg.vector_norm(force, dim=-1) > threshold
 
-  body_vel_w = getattr(asset.data, "body_link_lin_vel_w", None)
-  if body_vel_w is None:
-    body_vel_w = getattr(asset.data, "body_lin_vel_w", None)
-  if body_vel_w is None:
-    return torch.zeros(env.num_envs, device=env.device)
-
-  body_ids = asset_cfg.body_ids
-  if isinstance(body_ids, slice):
-    body_ids = list(range(body_vel_w.shape[1]))[body_ids]
-  else:
-    body_ids = list(body_ids)
-  if len(body_ids) == 0:
-    return torch.zeros(env.num_envs, device=env.device)
-
-  foot_vel_xy = body_vel_w[:, body_ids, :2]
+  foot_vel_xy = asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids, :2]
   slip_speed = torch.norm(foot_vel_xy, dim=-1)
   # Original: torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
   # No slip speed threshold/clamp — penalize raw speed
@@ -229,13 +200,7 @@ def link_orientation(
 ) -> torch.Tensor:
   """Penalize non-flat link orientation using L2 squared kernel."""
   asset: Entity = env.scene[asset_cfg.name]
-  body_quat_w = getattr(asset.data, "body_link_quat_w", None)
-  if body_quat_w is None:
-    body_quat_w = getattr(asset.data, "body_quat_w", None)
-  if body_quat_w is None:
-    raise AttributeError("Robot data is missing body_link_quat_w/body_quat_w for orientation terms.")
-
-  link_quat = body_quat_w[:, asset_cfg.body_ids[0], :]
+  link_quat = asset.data.body_link_quat_w[:, asset_cfg.body_ids[0], :]
   link_projected_gravity = quat_apply_inverse(link_quat, asset.data.gravity_vec_w)
   return torch.sum(torch.square(link_projected_gravity[:, :2]), dim=1)
 
@@ -250,13 +215,7 @@ def feet_orientation_contact(
   asset: Entity = env.scene[asset_cfg.name]
   contact_sensor: ContactSensor = env.scene[sensor_name]
 
-  body_quat_w = getattr(asset.data, "body_link_quat_w", None)
-  if body_quat_w is None:
-    body_quat_w = getattr(asset.data, "body_quat_w", None)
-  if body_quat_w is None:
-    raise AttributeError("Robot data is missing body_link_quat_w/body_quat_w for orientation terms.")
-
-  body_quat_w = body_quat_w[:, asset_cfg.body_ids, :]
+  body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]
   num_envs, num_feet = body_quat_w.shape[:2]
 
   gravity_w = asset.data.gravity_vec_w.unsqueeze(1).expand(-1, num_feet, -1)
@@ -265,53 +224,32 @@ def feet_orientation_contact(
   ).reshape(num_envs, num_feet, 3)
   orientation_error = torch.linalg.vector_norm(projected_gravity[:, :, :2], dim=-1)
 
-  if contact_sensor.data.force is not None:
-    in_contact = torch.linalg.vector_norm(contact_sensor.data.force, dim=-1) > contact_force_threshold
-  elif contact_sensor.data.found is not None:
-    in_contact = contact_sensor.data.found > 0
+  force_history = contact_sensor.data.force_history
+  if force_history is not None:
+    in_contact = (
+      torch.max(torch.linalg.vector_norm(force_history, dim=-1), dim=2)[0]
+      > contact_force_threshold
+    )
   else:
-    return torch.zeros(env.num_envs, device=env.device)
+    force = contact_sensor.data.force
+    assert force is not None
+    in_contact = torch.linalg.vector_norm(force, dim=-1) > contact_force_threshold
 
-  if in_contact.ndim == 1:
-    in_contact = in_contact.unsqueeze(-1)
-  in_contact = in_contact[:, :num_feet]
   return torch.sum(orientation_error * in_contact.float(), dim=1)
 
 
 def feet_at_plane(
   env: ManagerBasedRlEnv,
-  contact_sensor_name: str | None = None,
-  left_height_scanner_name: str | None = None,
-  right_height_scanner_name: str | None = None,
+  contact_sensor_name: str,
+  left_height_scanner_name: str,
+  right_height_scanner_name: str,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   height_offset: float = 0.035,
   contact_force_threshold: float = 1.0,
-  contact_sensor_cfg: SceneEntityCfg | None = None,
-  left_height_scanner_cfg: SceneEntityCfg | None = None,
-  right_height_scanner_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
   """Reward feet being at certain height above the ground plane."""
-  if contact_sensor_name is None:
-    if contact_sensor_cfg is None:
-      raise ValueError("Either contact_sensor_name or contact_sensor_cfg must be provided.")
-    contact_sensor_name = contact_sensor_cfg.name
-  if left_height_scanner_name is None:
-    if left_height_scanner_cfg is None:
-      raise ValueError("Either left_height_scanner_name or left_height_scanner_cfg must be provided.")
-    left_height_scanner_name = left_height_scanner_cfg.name
-  if right_height_scanner_name is None:
-    if right_height_scanner_cfg is None:
-      raise ValueError("Either right_height_scanner_name or right_height_scanner_cfg must be provided.")
-    right_height_scanner_name = right_height_scanner_cfg.name
-
   asset: Entity = env.scene[asset_cfg.name]
-  body_pos_w = getattr(asset.data, "body_link_pos_w", None)
-  if body_pos_w is None:
-    body_pos_w = getattr(asset.data, "body_pos_w", None)
-  if body_pos_w is None:
-    body_pos_w = getattr(asset.data, "body_com_pos_w", None)
-  if body_pos_w is None:
-    raise AttributeError("Robot data is missing body_link_pos_w/body_pos_w/body_com_pos_w for foot terms.")
+  body_pos_w = asset.data.body_link_pos_w
 
   body_ids = asset_cfg.body_ids
   if isinstance(body_ids, slice):
@@ -319,17 +257,19 @@ def feet_at_plane(
   else:
     body_ids = list(body_ids)
   if len(body_ids) < 2:
-    return torch.zeros(env.num_envs, device=env.device)
+    raise ValueError("feet_at_plane expects at least two body ids in asset_cfg.")
 
   contact_sensor: ContactSensor = env.scene[contact_sensor_name]
-  if contact_sensor.data.force is not None:
-    is_contact = torch.linalg.vector_norm(contact_sensor.data.force, dim=-1) > contact_force_threshold
-  elif contact_sensor.data.found is not None:
-    is_contact = contact_sensor.data.found > 0
+  force_history = contact_sensor.data.force_history
+  if force_history is not None:
+    is_contact = (
+      torch.max(torch.linalg.vector_norm(force_history, dim=-1), dim=2)[0]
+      > contact_force_threshold
+    )
   else:
-    is_contact = torch.zeros((env.num_envs, 2), dtype=torch.bool, device=env.device)
-  if is_contact.ndim == 1:
-    is_contact = is_contact.unsqueeze(-1)
+    force = contact_sensor.data.force
+    assert force is not None
+    is_contact = torch.linalg.vector_norm(force, dim=-1) > contact_force_threshold
 
   left_sensor: RayCastSensor = env.scene[left_height_scanner_name]
   right_sensor: RayCastSensor = env.scene[right_height_scanner_name]
@@ -342,7 +282,7 @@ def feet_at_plane(
   right_height = body_pos_w[:, body_ids[1], 2].unsqueeze(-1)
 
   left_contact = is_contact[:, 0:1].float()
-  right_contact = is_contact[:, 1:2].float() if is_contact.shape[1] > 1 else 0.0
+  right_contact = is_contact[:, 1:2].float()
 
   left_reward = torch.clamp(left_height - left_hit_z - height_offset, min=0.0, max=0.3) * left_contact
   right_reward = torch.clamp(right_height - right_hit_z - height_offset, min=0.0, max=0.3) * right_contact
@@ -357,17 +297,9 @@ def feet_close_xy_gauss(
 ) -> torch.Tensor:
   """Penalize when feet are too close together in the y distance."""
   asset: Entity = env.scene[asset_cfg.name]
-  body_pos_w = getattr(asset.data, "body_link_pos_w", None)
-  if body_pos_w is None:
-    body_pos_w = getattr(asset.data, "body_pos_w", None)
-  if body_pos_w is None:
-    body_pos_w = getattr(asset.data, "body_com_pos_w", None)
-  if body_pos_w is None:
-    raise AttributeError("Robot data is missing body_link_pos_w/body_pos_w/body_com_pos_w for foot terms.")
-
-  body_pos_w = body_pos_w[:, asset_cfg.body_ids, :]
+  body_pos_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids, :]
   if body_pos_w.shape[1] < 2:
-    return torch.zeros(env.num_envs, device=env.device)
+    raise ValueError("feet_close_xy_gauss expects at least two body ids in asset_cfg.")
 
   left_foot_xy = body_pos_w[:, 0, :2]
   right_foot_xy = body_pos_w[:, 1, :2]
@@ -406,38 +338,17 @@ def motors_power_square(
   normalize_by_num_joints: bool = False,
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
-  torque = getattr(asset.data, "applied_torque", None)
-  if torque is None:
-    torque = getattr(asset.data, "actuator_force", None)
-  if torque is None:
-    torque = torch.zeros_like(asset.data.joint_vel, device=env.device)
-  elif torque.shape != asset.data.joint_vel.shape:
-    matched_torque = torch.zeros_like(asset.data.joint_vel, device=env.device)
-    num_cols = min(matched_torque.shape[1], torque.shape[1])
-    matched_torque[:, :num_cols] = torque[:, :num_cols]
-    torque = matched_torque
-
-  power_j = torque * asset.data.joint_vel
+  # mjlab uses actuator_force instead of applied_torque
+  power_j = asset.data.actuator_force * asset.data.joint_vel
   if normalize_by_stiffness:
-    actuators = asset.actuators.values() if isinstance(asset.actuators, dict) else asset.actuators
-    for actuator in actuators:
-      stiffness = getattr(actuator, "stiffness", None)
-      joint_indices = getattr(actuator, "joint_indices", None)
-      if stiffness is None or joint_indices is None:
-        continue
-      joint_indices = torch.as_tensor(joint_indices, device=env.device, dtype=torch.long)
-      if joint_indices.numel() == 0:
-        continue
-
-      if torch.is_tensor(stiffness):
-        if stiffness.ndim == 2:
-          stiffness_values = stiffness[:, :joint_indices.numel()]
-        else:
-          stiffness_values = stiffness[:joint_indices.numel()]
-      else:
-        stiffness_values = torch.as_tensor(stiffness, device=env.device, dtype=power_j.dtype)
-
-      power_j[:, joint_indices] = power_j[:, joint_indices] / torch.clamp(stiffness_values, min=1e-6)
+    # mjlab: asset.actuators is a list, not a dict
+    for actuator in asset.actuators:
+      # Handle DelayedActuator wrapper - access base actuator properties
+      base_actuator = getattr(actuator, 'base_actuator', actuator)
+      target_ids = base_actuator.target_ids
+      stiffness = getattr(base_actuator, 'stiffness', None)
+      if stiffness is not None:
+        power_j[:, target_ids] /= stiffness
 
   power_j = power_j[:, asset_cfg.joint_ids]
   power = torch.sum(torch.square(power_j), dim=-1)
@@ -450,19 +361,40 @@ def joint_vel_limits(
   env: ManagerBasedRlEnv,
   soft_ratio: float,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  max_vel: float = 10.0,
 ) -> torch.Tensor:
-  asset: Entity = env.scene[asset_cfg.name]
-  joint_vel_limits = getattr(asset.data, "joint_vel_limits", None)
-  if joint_vel_limits is None:
-    joint_vel_limits = getattr(asset.data, "joint_velocity_limits", None)
-  if joint_vel_limits is None:
-    return torch.zeros(env.num_envs, device=env.device)
-  if joint_vel_limits.ndim == 1:
-    joint_vel_limits = joint_vel_limits.unsqueeze(0).expand_as(asset.data.joint_vel)
+  """Penalize joint velocities if they cross soft limits.
 
-  vel_abs = torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids])
-  soft_limits = joint_vel_limits[:, asset_cfg.joint_ids] * soft_ratio
-  out_of_limits = torch.clamp(vel_abs - soft_limits, min=0.0)
+  Mirrors the original Isaac Lab ``joint_vel_limits``:
+  ``abs(joint_vel) - soft_joint_vel_limits * soft_ratio`` clipped to [0, 1].
+  In mjlab, per-joint velocity limits are collected from actuator configs.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+
+  # mjlab adaptation: build joint-wise velocity limits from actuators.
+  # Fallback to max_vel when an actuator does not expose velocity limits.
+  joint_vel_limits = torch.full_like(asset.data.joint_vel, fill_value=max_vel)
+  for actuator in asset.actuators:
+    base_actuator = getattr(actuator, "base_actuator", actuator)
+    target_ids = base_actuator.target_ids
+
+    velocity_limit = getattr(base_actuator, "velocity_limit_motor", None)
+    if velocity_limit is None:
+      velocity_limit = getattr(getattr(base_actuator, "cfg", None), "velocity_limit", None)
+    if velocity_limit is None:
+      continue
+
+    if torch.is_tensor(velocity_limit):
+      joint_vel_limits[:, target_ids] = velocity_limit
+    else:
+      joint_vel_limits[:, target_ids] = float(velocity_limit)
+
+  out_of_limits = (
+    torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids])
+    - joint_vel_limits[:, asset_cfg.joint_ids] * soft_ratio
+  )
+  # Clip to max error = 1 rad/s per joint to avoid huge penalties
+  out_of_limits = out_of_limits.clip_(min=0.0, max=1.0)
   return torch.sum(out_of_limits, dim=1)
 
 
@@ -471,14 +403,31 @@ def applied_torque_limits_by_ratio(
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   limit_ratio: float = 0.8,
 ) -> torch.Tensor:
+  """Penalize actuator forces exceeding a ratio of their limits.
+  
+  Note: mjlab stores effort limits in actuator.force_limit, not in EntityData.
+  We collect limits from all actuators and construct the full limit tensor.
+  """
   asset: Entity = env.scene[asset_cfg.name]
-  joint_effort_limits = getattr(asset.data, "joint_effort_limits", None)
-  if joint_effort_limits is None:
-    return torch.zeros(env.num_envs, device=env.device)
-
+  
+  # Collect effort limits from actuators
+  num_envs = asset.data.actuator_force.shape[0]
+  num_joints = asset.data.actuator_force.shape[1]
+  joint_effort_limits = torch.zeros((num_envs, num_joints), device=env.device)
+  
+  for actuator in asset.actuators:
+    # Handle DelayedActuator wrapper
+    base_actuator = getattr(actuator, 'base_actuator', actuator)
+    target_ids = base_actuator.target_ids
+    force_limit = getattr(base_actuator, 'force_limit', None)
+    if force_limit is not None:
+      joint_effort_limits[:, target_ids] = force_limit
+  
+  # Select only the joints specified in asset_cfg
   joint_effort_limits = joint_effort_limits[:, asset_cfg.joint_ids]
-  applied_torque = torch.abs(asset.data.applied_torque[:, asset_cfg.joint_ids])
-  out_of_limits = torch.clamp(applied_torque - joint_effort_limits * limit_ratio, min=0.0)
+  # mjlab uses actuator_force instead of applied_torque
+  applied_torque = torch.abs(asset.data.actuator_force[:, asset_cfg.joint_ids])
+  out_of_limits = (applied_torque - joint_effort_limits * limit_ratio).clip(min=0)
   return torch.sum(torch.square(out_of_limits), dim=-1)
 
 
@@ -488,13 +437,12 @@ def undesired_contacts(
   threshold: float,
 ) -> torch.Tensor:
   contact_sensor: ContactSensor = env.scene[sensor_name]
-  if contact_sensor.data.force is not None:
-    is_contact = torch.linalg.vector_norm(contact_sensor.data.force, dim=-1) > threshold
-  elif contact_sensor.data.found is not None:
-    is_contact = contact_sensor.data.found > 0
+  force_history = contact_sensor.data.force_history
+  if force_history is not None:
+    is_contact = torch.max(torch.linalg.vector_norm(force_history, dim=-1), dim=2)[0] > threshold
   else:
-    return torch.zeros(env.num_envs, device=env.device)
+    force = contact_sensor.data.force
+    assert force is not None
+    is_contact = torch.linalg.vector_norm(force, dim=-1) > threshold
 
-  if is_contact.ndim == 1:
-    is_contact = is_contact.unsqueeze(-1)
   return torch.sum(is_contact.float(), dim=1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import re
 from typing import TYPE_CHECKING, Any
 
 import mujoco

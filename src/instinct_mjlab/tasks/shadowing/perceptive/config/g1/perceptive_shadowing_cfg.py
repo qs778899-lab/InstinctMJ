@@ -166,6 +166,8 @@ class G1PerceptiveShadowingEnvCfg(perceptual_cfg.PerceptiveShadowingEnvCfg):
             self.scene.terrain.terrain_generator.sub_terrains["motion_matched"].metadata_yaml = os.path.join(
                 self.scene.motion_reference.motion_buffers[MOTION_NAME].path, "metadata.yaml"
             )
+        active_motion_name = list(self.scene.motion_reference.motion_buffers.keys())[0]
+        active_motion_buffer = self.scene.motion_reference.motion_buffers[active_motion_name]
 
         # match key links for observation terms
         self.observations["critic"].terms["link_pos"].params["asset_cfg"].body_names = self.scene.motion_reference.link_of_interests
@@ -175,7 +177,7 @@ class G1PerceptiveShadowingEnvCfg(perceptual_cfg.PerceptiveShadowingEnvCfg):
             [
                 (
                     "_concatMotionBins"
-                    if self.scene.motion_reference.motion_buffers[MOTION_NAME].env_starting_stub_sampling_strategy
+                    if active_motion_buffer.env_starting_stub_sampling_strategy
                     == "concat_motion_bins"
                     else "_independentMotionBins"
                 ),

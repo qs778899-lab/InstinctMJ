@@ -13,11 +13,11 @@ from mjlab.utils.lab_api.math import wrap_to_pi, yaw_quat
 
 from instinct_mjlab.managers import CommandTerm
 from instinct_mjlab.terrains import TerrainImporter
-from mjlab.markers import VisualizationMarkers
 
 if TYPE_CHECKING:
-    from mjlab.entity import Entity as Articulation
-    from mjlab.envs import ManagerBasedRlEnv as ManagerBasedEnv
+    from mjlab.entity import Entity
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.viewer.debug_visualizer import DebugVisualizer
 
     from .commands_cfg import PoseVelocityCommandCfg
 
@@ -28,7 +28,7 @@ class PoseVelocityCommand(CommandTerm):
     cfg: PoseVelocityCommandCfg
     """Configuration for the command generator."""
 
-    def __init__(self, cfg: PoseVelocityCommandCfg, env: ManagerBasedEnv):
+    def __init__(self, cfg: PoseVelocityCommandCfg, env: ManagerBasedRlEnv):
         """Initialize the command generator class.
 
         Args:
@@ -40,7 +40,7 @@ class PoseVelocityCommand(CommandTerm):
 
         # obtain the robot and terrain assets
         # -- robot
-        self.robot: Articulation = env.scene[cfg.entity_name]
+        self.robot: Entity = env.scene[cfg.entity_name]
 
         # crete buffers to store the command
         self.pos_command_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -73,14 +73,7 @@ class PoseVelocityCommand(CommandTerm):
         self.random_lin_vel_y = torch.zeros(self.num_envs, device=self.device)
         self.random_ang_vel_z = torch.zeros(self.num_envs, device=self.device)
 
-        velocity_ranges = self.cfg.velocity_ranges or {}
-        random_velocity_terrains = self.cfg.random_velocity_terrain or []
-        if velocity_ranges or random_velocity_terrains:
-            if self.terrain.cfg.terrain_type != "generator" or self.terrain.cfg.terrain_generator is None:
-                raise RuntimeError(
-                    "PoseVelocityCommand terrain-aware ranges require generator terrain with terrain_generator."
-                )
-
+        if self.cfg.velocity_ranges is not None:
             terrain_generator_cfg = self.terrain.cfg.terrain_generator
             proportions = np.array([sub_cfg.proportion for sub_cfg in terrain_generator_cfg.sub_terrains.values()])
             proportions /= np.sum(proportions)
@@ -92,29 +85,29 @@ class PoseVelocityCommand(CommandTerm):
                 sub_index = np.min(np.where(index / terrain_generator_cfg.num_cols + 0.001 < np.cumsum(proportions))[0])
                 sub_indices.append(sub_index)
             sub_indices = np.array(sub_indices, dtype=np.int32)
-            sub_terrain_names = list(terrain_generator_cfg.sub_terrains.keys())
-            for key, value in velocity_ranges.items():
-                if key not in sub_terrain_names:
+            sub_terrains_names = list(terrain_generator_cfg.sub_terrains.keys())
+            for key, value in self.cfg.velocity_ranges.items():
+                if key in sub_terrains_names:
+                    terrain_type_index = sub_terrains_names.index(key)
+                    type_indices = np.where(sub_indices == terrain_type_index)[0]
+                    for type_indice in type_indices:
+                        env_indices = torch.where(self.terrain.terrain_types == type_indice)[0]
+                        self.lin_vel_x_range[env_indices, 0] = value["lin_vel_x"][0]
+                        self.lin_vel_x_range[env_indices, 1] = value["lin_vel_x"][1]
+                        self.lin_vel_y_range[env_indices, 0] = value["lin_vel_y"][0]
+                        self.lin_vel_y_range[env_indices, 1] = value["lin_vel_y"][1]
+                        self.ang_vel_z_range[env_indices, 0] = value["ang_vel_z"][0]
+                        self.ang_vel_z_range[env_indices, 1] = value["ang_vel_z"][1]
+                else:
                     raise RuntimeError(f"Terrain type {key} not found in the terrain generator sub-terrain names.")
-                terrain_type_index = sub_terrain_names.index(key)
-                terrain_columns = np.where(sub_indices == terrain_type_index)[0]
-                for terrain_column in terrain_columns:
-                    env_indices = torch.where(self.terrain.terrain_types == terrain_column)[0]
-                    self.lin_vel_x_range[env_indices, 0] = value["lin_vel_x"][0]
-                    self.lin_vel_x_range[env_indices, 1] = value["lin_vel_x"][1]
-                    self.lin_vel_y_range[env_indices, 0] = value["lin_vel_y"][0]
-                    self.lin_vel_y_range[env_indices, 1] = value["lin_vel_y"][1]
-                    self.ang_vel_z_range[env_indices, 0] = value["ang_vel_z"][0]
-                    self.ang_vel_z_range[env_indices, 1] = value["ang_vel_z"][1]
 
-            for key in random_velocity_terrains:
-                if key not in sub_terrain_names:
-                    raise RuntimeError(f"Terrain type {key} not found in the terrain generator sub-terrain names.")
-                terrain_type_index = sub_terrain_names.index(key)
-                terrain_columns = np.where(sub_indices == terrain_type_index)[0]
-                for terrain_column in terrain_columns:
-                    env_indices = torch.where(self.terrain.terrain_types == terrain_column)[0]
-                    self.random_velocity_indices[env_indices] = True
+            if self.cfg.random_velocity_terrain is not None:
+                for key in self.cfg.random_velocity_terrain:
+                    terrain_type_index = sub_terrains_names.index(key)
+                    type_indices = np.where(sub_indices == terrain_type_index)[0]
+                    for type_indice in type_indices:
+                        env_indices = torch.where(self.terrain.terrain_types == type_indice)[0]
+                        self.random_velocity_indices[env_indices] = True
 
         self.random_lin_vel_x_range[:, 0] = self.cfg.ranges.lin_vel_x[0]
         self.random_lin_vel_x_range[:, 1] = self.cfg.ranges.lin_vel_x[1]
@@ -304,71 +297,109 @@ class PoseVelocityCommand(CommandTerm):
         self.vel_command_b[random_velocity_env_ids, 1] = self.random_lin_vel_y[random_velocity_env_ids]
         self.vel_command_b[random_velocity_env_ids, 2] = self.random_ang_vel_z[random_velocity_env_ids]
 
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        # create markers if necessary for the first tome
-        if debug_vis:
-            if not hasattr(self, "flat_patch_visualizer"):
-                # -- pose
-                self.cfg.flat_patch_visualizer_cfg.markers["Goal"].radius = self.cfg.target_dis_threshold
-                self.cfg.flat_patch_visualizer_cfg.markers["Patches"].radius = self.cfg.target_dis_threshold
-                self.flat_patch_visualizer = VisualizationMarkers(self.cfg.flat_patch_visualizer_cfg)
-                # -- goal
-                self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
-                # -- current
-                self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
-            # set their visibility to true
-            self.flat_patch_visualizer.set_visibility(True)
-            self.goal_vel_visualizer.set_visibility(True)
-            self.current_vel_visualizer.set_visibility(True)
-        else:
-            if hasattr(self, "flat_patch_visualizer"):
-                self.flat_patch_visualizer.set_visibility(False)
-                self.goal_vel_visualizer.set_visibility(False)
-                self.current_vel_visualizer.set_visibility(False)
-
-    def _debug_vis_callback(self, event):
-        if not self.robot.is_initialized:
+    def _debug_vis_impl(self, visualizer) -> None:
+        """Draw target positions and velocity arrows using MuJoCo geometry.
+        
+        This replaces the Isaac Lab VisualizationMarkers with native MuJoCo visualization.
+        """
+        env_indices = visualizer.get_env_indices(self.num_envs)
+        if not env_indices:
             return
-        if getattr(self.cfg, "patch_vis", True):
-            flat_patches = self.valid_targets.reshape(-1, 3)
-            poses = torch.cat([self.pos_command_w, flat_patches], dim=0)
-            marker_indices = torch.cat(
-                [
-                    torch.zeros(self.num_envs, dtype=torch.int, device=self.device),
-                    torch.ones(flat_patches.shape[0], dtype=torch.int, device=self.device),
-                ],
-                dim=0,
+
+        # Convert to numpy for visualization
+        pos_commands_w = self.pos_command_w.cpu().numpy()
+        vel_commands_b = self.vel_command_b.cpu().numpy()
+        base_pos_ws = self.robot.data.root_link_pos_w.cpu().numpy()
+        base_quat_ws = self.robot.data.root_link_quat_w.cpu().numpy()
+        lin_vel_bs = self.robot.data.root_link_lin_vel_b.cpu().numpy()
+
+        # Visualization parameters
+        goal_radius = self.cfg.target_dis_threshold
+        goal_height = 0.1
+        patch_height = 0.05
+        arrow_z_offset = 0.5
+        arrow_scale = 0.5
+
+        for batch in env_indices:
+            # Skip if robot appears uninitialized (at origin)
+            if np.linalg.norm(base_pos_ws[batch]) < 1e-6:
+                continue
+
+            # 1. Draw target position as red cylinder (InstinctLab marker semantics)
+            goal_pos = pos_commands_w[batch]
+            goal_start = goal_pos.copy()
+            goal_end = goal_pos.copy()
+            goal_end[2] += goal_height
+            visualizer.add_cylinder(
+                start=goal_start,
+                end=goal_end,
+                radius=goal_radius,
+                color=(1.0, 0.0, 0.0, 0.6),
+                label=f"goal_{batch}",
             )
-            self.flat_patch_visualizer.visualize(poses, marker_indices=marker_indices)
-        else:
-            marker_indices = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
-            self.flat_patch_visualizer.visualize(self.pos_command_w, marker_indices=marker_indices)
-        # get marker location
-        # -- base state
-        base_pos_w = self.robot.data.root_link_pos_w.clone()
-        base_pos_w[:, 2] += 0.5
-        # -- resolve the scales and quaternions
-        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_xy_velocity_to_arrow(self.command[:, :2])
-        vel_arrow_scale, vel_arrow_quat = self._resolve_xy_velocity_to_arrow(
-            self.robot.data.root_link_lin_vel_b[:, :2]
-        )
-        # display markers
-        self.goal_vel_visualizer.visualize(base_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
-        self.current_vel_visualizer.visualize(base_pos_w, vel_arrow_quat, vel_arrow_scale)
 
-    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Converts the XY base velocity command to arrow direction rotation."""
-        # obtain default scale of the marker
-        default_scale = self.goal_vel_visualizer.cfg.markers["arrow"].scale
-        # arrow-scale
-        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_velocity.shape[0], 1)
-        arrow_scale[:, 0] *= torch.linalg.norm(xy_velocity, dim=1) * 8.0
-        # arrow-direction
-        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
-        zeros = torch.zeros_like(heading_angle)
-        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
-        # convert everything back from base to world frame
-        base_quat_w = self.robot.data.root_link_quat_w
-        arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
+            # 2. Draw commanded velocity arrow (green)
+            base_pos = base_pos_ws[batch]
+            arrow_start = base_pos.copy()
+            arrow_start[2] += arrow_z_offset
+            
+            # Convert velocity command from body frame to world frame
+            vel_cmd_b = vel_commands_b[batch]
+            quat_w = base_quat_ws[batch]
+            # Simple rotation: only yaw matters for horizontal velocity
+            yaw = np.arctan2(2.0 * (quat_w[0] * quat_w[3] + quat_w[1] * quat_w[2]),
+                           1.0 - 2.0 * (quat_w[2]**2 + quat_w[3]**2))
+            cos_yaw = np.cos(yaw)
+            sin_yaw = np.sin(yaw)
+            vel_cmd_w = np.array([
+                cos_yaw * vel_cmd_b[0] - sin_yaw * vel_cmd_b[1],
+                sin_yaw * vel_cmd_b[0] + cos_yaw * vel_cmd_b[1],
+                0.0
+            ])
+            
+            arrow_end = arrow_start + vel_cmd_w * arrow_scale
+            visualizer.add_arrow(
+                start=arrow_start,
+                end=arrow_end,
+                color=(0.1, 1.0, 0.1, 0.8),  # Bright green
+                width=0.02,
+                label=f"cmd_vel_{batch}",
+            )
 
-        return arrow_scale, arrow_quat
+            # 3. Draw actual velocity arrow (blue)
+            lin_vel_b = lin_vel_bs[batch]
+            vel_actual_w = np.array([
+                cos_yaw * lin_vel_b[0] - sin_yaw * lin_vel_b[1],
+                sin_yaw * lin_vel_b[0] + cos_yaw * lin_vel_b[1],
+                0.0
+            ])
+            
+            arrow_end_actual = arrow_start + vel_actual_w * arrow_scale
+            visualizer.add_arrow(
+                start=arrow_start,
+                end=arrow_end_actual,
+                color=(0.1, 0.1, 1.0, 0.8),  # Bright blue
+                width=0.02,
+                label=f"actual_vel_{batch}",
+            )
+
+            # 4. Optionally draw all flat patches (if patch_vis is enabled)
+            if self.cfg.patch_vis:
+                valid_targets = self.valid_targets.cpu().numpy()
+                terrain_level = self.terrain.terrain_levels[batch].item()
+                terrain_type = self.terrain.terrain_types[batch].item()
+                patches = valid_targets[terrain_level, terrain_type]
+                
+                for i, patch_pos in enumerate(patches):
+                    if np.linalg.norm(patch_pos) < 1e-6:  # Skip invalid patches
+                        continue
+                    patch_start = patch_pos.copy()
+                    patch_end = patch_pos.copy()
+                    patch_end[2] += patch_height
+                    visualizer.add_cylinder(
+                        start=patch_start,
+                        end=patch_end,
+                        radius=goal_radius,
+                        color=(0.0, 0.0, 1.0, 0.3),
+                        label=f"patch_{batch}_{i}",
+                    )

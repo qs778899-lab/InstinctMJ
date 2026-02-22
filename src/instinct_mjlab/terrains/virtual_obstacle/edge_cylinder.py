@@ -23,6 +23,8 @@ from instinct_mjlab.utils.warp.cylinder import CylinderSpatialGrid
 from .virtual_obstacle_base import VirtualObstacleBase
 
 if TYPE_CHECKING:
+    from mjlab.viewer.debug_visualizer import DebugVisualizer
+
     from .edge_cylinder_cfg import (
         EdgeCylinderCfg,
         GreedyconcatEdgeCylinderCfg,
@@ -30,6 +32,17 @@ if TYPE_CHECKING:
         RansacEdgeCylinderCfg,
         RayEdgeCylinderCfg,
     )
+
+
+def _marker_rgba_from_cfg(marker_cfg, default_rgba: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    visual_material = getattr(marker_cfg, "visual_material", None)
+    if visual_material is None:
+        return default_rgba
+    diffuse = getattr(visual_material, "diffuse_color", default_rgba[:3])
+    opacity = getattr(visual_material, "opacity", default_rgba[3])
+    if opacity is None:
+        opacity = 1.0
+    return (float(diffuse[0]), float(diffuse[1]), float(diffuse[2]), float(opacity))
 
 
 class EdgeCylinder(VirtualObstacleBase):
@@ -135,6 +148,20 @@ class EdgeCylinder(VirtualObstacleBase):
             if self.cylinders is not None
             else torch.zeros_like(points, device=self.device)
         )
+
+    def debug_vis(self, visualizer: "DebugVisualizer") -> None:
+        if self.edges_pyt.numel() == 0:
+            return
+        marker_cfg = self.cfg.visualizer.markers.get("cylinder", None)
+        rgba = _marker_rgba_from_cfg(marker_cfg, default_rgba=(0.0, 0.0, 0.9, 0.2))
+        radius = float(self.cfg.cylinder_radius)
+        for edge in self.edges_pyt:
+            visualizer.add_cylinder(
+                start=edge[:3],
+                end=edge[3:6],
+                radius=radius,
+                color=rgba,
+            )
 
     def process_edges(self, edge_coords: np.ndarray) -> np.ndarray:
         """Process the edge coordinates.
@@ -389,7 +416,7 @@ class GreedyconcatEdgeCylinder(EdgeCylinder):
             while len(v_set) >= self.cfg.min_points:
                 for i in range(len(v_set) - 1):
                     max_vi, max_dist = compute_max_distance_to_line_vec(V, v_set[i:])
-                    if max_dist < 0.05:
+                    if max_dist < self.cfg.point_distance_threshold:
                         break
                 if len(v_set) - i >= self.cfg.min_points:
                     processed_edge_coords.append(np.concatenate([V[v_set[i]], V[v_set[-1]]]))
@@ -646,6 +673,30 @@ class RayEdgeCylinder(VirtualObstacleBase):
             if self.cylinders is not None
             else torch.zeros_like(points, device=self.device)
         )
+
+    def debug_vis(self, visualizer: "DebugVisualizer") -> None:
+        if self.edges_pyt.numel() != 0:
+            cylinder_marker_cfg = self.cfg.visualizer.markers.get("cylinder", None)
+            cylinder_rgba = _marker_rgba_from_cfg(cylinder_marker_cfg, default_rgba=(0.0, 0.0, 0.9, 0.2))
+            radius = float(self.cfg.cylinder_radius)
+            for edge in self.edges_pyt:
+                visualizer.add_cylinder(
+                    start=edge[:3],
+                    end=edge[3:6],
+                    radius=radius,
+                    color=cylinder_rgba,
+                )
+
+        if self.points_list.numel() != 0:
+            sphere_marker_cfg = self.cfg.points_visualizer.markers.get("sphere", None)
+            sphere_rgba = _marker_rgba_from_cfg(sphere_marker_cfg, default_rgba=(0.0, 0.5, 0.5, 1.0))
+            sphere_radius = float(getattr(sphere_marker_cfg, "radius", 0.01))
+            for point in self.points_list:
+                visualizer.add_sphere(
+                    center=point,
+                    radius=sphere_radius,
+                    color=sphere_rgba,
+                )
 
 
 def process_camera_edges(i, depth_image, normal_image, cfg):

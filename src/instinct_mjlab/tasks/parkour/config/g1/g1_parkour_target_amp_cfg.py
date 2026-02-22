@@ -10,6 +10,7 @@ mjlab-native factory functions.  Config classes (``G1ParkourRoughEnvCfg``,
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mujoco
@@ -21,9 +22,18 @@ from mjlab.viewer import ViewerConfig
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 
 from instinct_mjlab.assets.unitree_g1 import (
+  G1_29DOF_INSTINCTLAB_JOINT_ORDER,
+  G1_29Dof_TorsoBase_symmetric_augmentation_joint_mapping,
+  G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf,
+  G1_MJCF_PATH,
   beyondmimic_action_scale,
   beyondmimic_g1_29dof_delayed_actuator_cfgs,
 )
+from instinct_mjlab.motion_reference import MotionReferenceManagerCfg
+from instinct_mjlab.motion_reference.motion_files.amass_motion_cfg import (
+  AmassMotionCfg as AmassMotionCfgBase,
+)
+from instinct_mjlab.motion_reference.utils import motion_interpolate_bilinear
 from instinct_mjlab.tasks.parkour.config.parkour_env_cfg import (
   set_parkour_amp_observations,
   set_parkour_basic_settings,
@@ -33,60 +43,117 @@ from instinct_mjlab.tasks.parkour.config.parkour_env_cfg import (
   set_parkour_observations,
   set_parkour_play_overrides,
   set_parkour_rewards,
+  set_parkour_scene_visual_style,
   set_parkour_scene_sensors,
   set_parkour_terminations,
   set_parkour_terrain,
 )
-from instinct_mjlab.utils.motion_validation import resolve_datasets_root
 
-_DATASETS_ROOT = resolve_datasets_root()
 _PARKOUR_TASK_DIR = Path(__file__).resolve().parents[2]
 _PARKOUR_G1_WITH_SHOE_MJCF_PATH = (
   _PARKOUR_TASK_DIR / "mjcf" / "g1_29dof_torsoBase_popsicle_with_shoe.xml"
+)
+_PARKOUR_MOTION_REFERENCE_DIR = Path(
+  "~/Xyk/Datasets/data&model/parkour_motion_reference"
+).expanduser().resolve()
+_PARKOUR_FILTERED_MOTION_YAML = (
+  _PARKOUR_MOTION_REFERENCE_DIR / "parkour_motion_without_run.yaml"
 )
 
 
 # ---------------------------------------------------------------------------
 # Motion reference configs (mirrors InstinctLab AmassMotionCfg)
 # ---------------------------------------------------------------------------
-# NOTE(migration): In the original InstinctLab, MotionReferenceManagerCfg
-# used ``motion_buffers = {"run_walk": AmassMotionCfg()}`` to load AMASS
-# motion data for AMP discriminator observations.
-#
-# In the mjlab migration, motion reference is provided by the tracking
-# base's ``commands["motion"]`` (MotionCommandCfg), which is inherited
-# from ``unitree_g1_flat_tracking_env_cfg()``.  The ``motion_file``
-# field is intentionally left empty and set at runtime by training
-# scripts (e.g. via CLI override or config injection).
-#
-# These classes are retained as config references for script-level
-# motion file resolution and retargeting pipeline compatibility.
 # ---------------------------------------------------------------------------
 
 
-class AmassMotionCfgBase:
-  """AmassMotion baseline config used by motion_reference.
-
-  NOTE(migration): This class is retained as a reference for motion file
-  resolution parameters.  The ``motion_interpolate_func`` references the
-  original ``motion_interpolate_bilinear`` utility.
-  """
-  path = str(_DATASETS_ROOT)
-  retargetting_func = None
-  filtered_motion_selection_filepath = str(
-    _DATASETS_ROOT / "parkour_motion_without_run.yaml"
-  )
-  motion_start_from_middle_range = [0.0, 0.9]
-  motion_start_height_offset = 0.0
-  ensure_link_below_zero_ground = False
-  buffer_device = "output_device"
-  # Original: motion_interpolate_bilinear from instinct_mjlab.motion_reference.utils
-  motion_interpolate_func = None
-  velocity_estimation_method = "frontward"
-
-
+@dataclass(kw_only=True)
 class AmassMotionCfg(AmassMotionCfgBase):
-  pass
+  """Parkour AMASS motion buffer config."""
+
+  path: str = str(_PARKOUR_MOTION_REFERENCE_DIR)
+  retargetting_func: object | None = None
+  filtered_motion_selection_filepath: str | None = str(_PARKOUR_FILTERED_MOTION_YAML)
+  motion_start_from_middle_range: list[float] = field(default_factory=lambda: [0.0, 0.9])
+  motion_start_height_offset: float = 0.0
+  ensure_link_below_zero_ground: bool = False
+  buffer_device: str = "output_device"
+  motion_interpolate_func: object = field(default_factory=lambda: motion_interpolate_bilinear)
+  velocity_estimation_method: str = "frontward"
+
+
+def _make_motion_reference_cfg() -> MotionReferenceManagerCfg:
+  """Build parkour motion reference manager config."""
+  # Convert InstinctLab symmetric augmentation joint mapping into the
+  # MuJoCo/MJCF joint index order used by mjlab entities.
+  model = mujoco.MjModel.from_xml_path(G1_MJCF_PATH)
+  mjlab_joint_order: list[str] = []
+  for joint_id in range(model.njnt):
+    if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+      continue
+    joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+    assert joint_name is not None
+    mjlab_joint_order.append(joint_name)
+
+  instinct_joint_order = list(G1_29DOF_INSTINCTLAB_JOINT_ORDER)
+  instinct_name_to_idx = {name: idx for idx, name in enumerate(instinct_joint_order)}
+  mjlab_name_to_idx = {name: idx for idx, name in enumerate(mjlab_joint_order)}
+
+  if set(instinct_joint_order) != set(mjlab_joint_order):
+    raise ValueError(
+      "Joint-name set mismatch between InstinctLab 29-DoF order and MJCF order."
+    )
+
+  symmetric_joint_mapping_mjlab: list[int] = []
+  symmetric_joint_reverse_buf_mjlab: list[int] = []
+  for joint_name in mjlab_joint_order:
+    inst_idx = instinct_name_to_idx[joint_name]
+    mirrored_inst_idx = G1_29Dof_TorsoBase_symmetric_augmentation_joint_mapping[inst_idx]
+    mirrored_joint_name = instinct_joint_order[mirrored_inst_idx]
+    symmetric_joint_mapping_mjlab.append(mjlab_name_to_idx[mirrored_joint_name])
+    symmetric_joint_reverse_buf_mjlab.append(
+      G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf[inst_idx]
+    )
+
+  return MotionReferenceManagerCfg(
+    entity_name="robot",
+    robot_model_path=G1_MJCF_PATH,
+    link_of_interests=[
+      "pelvis",
+      "torso_link",
+      "left_shoulder_roll_link",
+      "right_shoulder_roll_link",
+      "left_elbow_link",
+      "right_elbow_link",
+      "left_wrist_yaw_link",
+      "right_wrist_yaw_link",
+      "left_hip_roll_link",
+      "right_hip_roll_link",
+      "left_knee_link",
+      "right_knee_link",
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+    ],
+    symmetric_augmentation_link_mapping=[0, 1, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12],
+    symmetric_augmentation_joint_mapping=symmetric_joint_mapping_mjlab,
+    symmetric_augmentation_joint_reverse_buf=symmetric_joint_reverse_buf_mjlab,
+    frame_interval_s=0.02,
+    update_period=0.02,
+    num_frames=10,
+    motion_buffers={"run_walk": AmassMotionCfg()},
+    mp_split_method="Even",
+  )
+
+
+def _set_motion_reference_sensor(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Attach motion reference manager to the scene sensors."""
+  motion_reference_cfg = _make_motion_reference_cfg()
+  existing_sensors = tuple(
+    sensor_cfg
+    for sensor_cfg in cfg.scene.sensors
+    if sensor_cfg.name != motion_reference_cfg.name
+  )
+  cfg.scene.sensors = existing_sensors + (motion_reference_cfg,)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +165,11 @@ def _parkour_g1_with_shoe_spec() -> mujoco.MjSpec:
   """Build MjSpec for the G1 robot with shoe mesh."""
   spec = mujoco.MjSpec.from_file(str(_PARKOUR_G1_WITH_SHOE_MJCF_PATH))
   spec.assets = g1_constants.get_assets(spec.meshdir)
+  # InstinctLab shoe URDF does not include robot-mounted lights.
+  # Remove embedded per-robot lights to avoid localized over-bright spots.
+  for body in spec.bodies:
+    for light in tuple(body.lights):
+      spec.delete(light)
   return spec
 
 
@@ -110,6 +182,10 @@ def _apply_shoe_config(cfg: ManagerBasedRlEnvCfg) -> None:
   # Replace robot spec with shoe variant
   robot_cfg_with_shoe = copy.deepcopy(cfg.scene.entities["robot"])
   robot_cfg_with_shoe.spec_fn = _parkour_g1_with_shoe_spec
+  # The shoe MJCF comes from URDF conversion and does not carry *_collision geom
+  # names used by the asset-zoo regex collision override. Keep the URDF-authored
+  # collision setup as-is to match InstinctLab semantics.
+  robot_cfg_with_shoe.collisions = tuple()
   cfg.scene.entities["robot"] = robot_cfg_with_shoe
 
   # Adjust leg volume points z-range for shoes
@@ -135,8 +211,8 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> None:
     distance=4.123105625617661,
     elevation=-14.036243467926479,
     azimuth=180.0,
-    origin_type=ViewerConfig.OriginType.ASSET_ROOT,
-    entity_name="robot",
+    origin_type=ViewerConfig.OriginType.WORLD,
+    entity_name=None,
   )
 
 
@@ -160,6 +236,9 @@ def _set_parkour_actuators(cfg: ManagerBasedRlEnvCfg) -> None:
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
+  # Keep Parkour action dimensions aligned with InstinctLab 29-DoF joint order.
+  joint_pos_action.actuator_names = G1_29DOF_INSTINCTLAB_JOINT_ORDER
+  joint_pos_action.preserve_order = True
   joint_pos_action.scale = copy.deepcopy(beyondmimic_action_scale)
 
 
@@ -168,7 +247,11 @@ def _set_parkour_actuators(cfg: ManagerBasedRlEnvCfg) -> None:
 # ---------------------------------------------------------------------------
 
 
-def instinct_g1_parkour_amp_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvCfg:
+def instinct_g1_parkour_amp_env_cfg(
+  *,
+  play: bool = False,
+  shoe: bool = True,
+) -> ManagerBasedRlEnvCfg:
   """Build the base G1 parkour AMP environment configuration.
 
   Mirrors the original InstinctLab ``G1ParkourRoughEnvCfg`` assembly:
@@ -179,12 +262,17 @@ def instinct_g1_parkour_amp_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvC
   Args:
     play: If True, apply play-mode overrides (fewer envs, relaxed
       termination, etc.).
+    shoe: If True, apply shoe-specific adjustments (default is True,
+      matching the original ``G1ParkourEnvCfg`` behavior expected by
+      parkour task entry points).
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` instance with parkour settings applied.
   """
   # Scene settings (start from tracking base with G1 robot)
   cfg = unitree_g1_flat_tracking_env_cfg(play=play, has_state_estimation=True)
+  # Match InstinctLab parkour init height (G1_CFG.init_state.pos = (0, 0, 0.9)).
+  cfg.scene.entities["robot"].init_state.pos = (0.0, 0.0, 0.9)
 
   # Basic settings
   set_parkour_basic_settings(cfg)
@@ -192,8 +280,11 @@ def instinct_g1_parkour_amp_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvC
   _set_parkour_actuators(cfg)
   # Terrain
   set_parkour_terrain(cfg, play=play)
+  # Scene visual style
+  set_parkour_scene_visual_style(cfg)
   # Scene sensors
   set_parkour_scene_sensors(cfg)
+  _set_motion_reference_sensor(cfg)
 
   # MDP settings
   set_parkour_commands(cfg)
@@ -203,6 +294,10 @@ def instinct_g1_parkour_amp_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvC
   set_parkour_curriculum(cfg)
   set_parkour_terminations(cfg)
   set_parkour_events(cfg)
+
+  # Apply shoe-specific adjustments (matches original G1ParkourEnvCfg).
+  if shoe:
+    _apply_shoe_config(cfg)
 
   # general settings
   # simulation settings
@@ -235,11 +330,7 @@ def instinct_g1_parkour_amp_final_cfg(
     A fully-built ``ManagerBasedRlEnvCfg`` instance.
   """
   # Build base parkour config (already includes play overrides if requested)
-  cfg = instinct_g1_parkour_amp_env_cfg(play=play)
-
-  # Apply shoe-specific adjustments (matches original G1ParkourEnvCfg)
-  if shoe:
-    _apply_shoe_config(cfg)
+  cfg = instinct_g1_parkour_amp_env_cfg(play=play, shoe=shoe)
 
   # Apply play-mode viewer overrides
   if play:

@@ -14,10 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import mujoco
-from mjlab.asset_zoo.robots.unitree_g1 import g1_constants
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
-from mjlab.viewer import ViewerConfig
+from instinct_mjlab.envs.viewer_cfg import InstinctLabViewerConfig as ViewerConfig
 
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 
@@ -28,6 +27,7 @@ from instinct_mjlab.assets.unitree_g1 import (
   G1_MJCF_PATH,
   beyondmimic_action_scale,
   beyondmimic_g1_29dof_delayed_actuator_cfgs,
+  get_g1_assets,
 )
 from instinct_mjlab.motion_reference import MotionReferenceManagerCfg
 from instinct_mjlab.motion_reference.motion_files.amass_motion_cfg import (
@@ -99,11 +99,6 @@ def _make_motion_reference_cfg() -> MotionReferenceManagerCfg:
   instinct_name_to_idx = {name: idx for idx, name in enumerate(instinct_joint_order)}
   mjlab_name_to_idx = {name: idx for idx, name in enumerate(mjlab_joint_order)}
 
-  if set(instinct_joint_order) != set(mjlab_joint_order):
-    raise ValueError(
-      "Joint-name set mismatch between InstinctLab 29-DoF order and MJCF order."
-    )
-
   symmetric_joint_mapping_mjlab: list[int] = []
   symmetric_joint_reverse_buf_mjlab: list[int] = []
   for joint_name in mjlab_joint_order:
@@ -116,6 +111,7 @@ def _make_motion_reference_cfg() -> MotionReferenceManagerCfg:
     )
 
   return MotionReferenceManagerCfg(
+    name="motion_reference",
     entity_name="robot",
     robot_model_path=G1_MJCF_PATH,
     link_of_interests=[
@@ -164,7 +160,7 @@ def _set_motion_reference_sensor(cfg: ManagerBasedRlEnvCfg) -> None:
 def _parkour_g1_with_shoe_spec() -> mujoco.MjSpec:
   """Build MjSpec for the G1 robot with shoe mesh."""
   spec = mujoco.MjSpec.from_file(str(_PARKOUR_G1_WITH_SHOE_MJCF_PATH))
-  spec.assets = g1_constants.get_assets(spec.meshdir)
+  spec.assets = get_g1_assets(spec.meshdir)
   # InstinctLab shoe URDF does not include robot-mounted lights.
   # Remove embedded per-robot lights to avoid localized over-bright spots.
   for body in spec.bodies:
@@ -182,9 +178,9 @@ def _apply_shoe_config(cfg: ManagerBasedRlEnvCfg) -> None:
   # Replace robot spec with shoe variant
   robot_cfg_with_shoe = copy.deepcopy(cfg.scene.entities["robot"])
   robot_cfg_with_shoe.spec_fn = _parkour_g1_with_shoe_spec
-  # The shoe MJCF comes from URDF conversion and does not carry *_collision geom
-  # names used by the asset-zoo regex collision override. Keep the URDF-authored
-  # collision setup as-is to match InstinctLab semantics.
+  # Keep the URDF-authored collision setup as-is to match InstinctLab semantics.
+  # Even though shoe foot collision geoms now carry explicit names, we still
+  # avoid reapplying asset-zoo collision overrides for parity.
   robot_cfg_with_shoe.collisions = tuple()
   cfg.scene.entities["robot"] = robot_cfg_with_shoe
 
@@ -214,6 +210,8 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> None:
     origin_type=ViewerConfig.OriginType.WORLD,
     entity_name=None,
   )
+  # Keep debug visualization for all environments after replacing viewer config.
+  cfg.viewer.debug_vis_show_all_envs = True
 
 
 def _set_world_free_viewer(cfg: ManagerBasedRlEnvCfg) -> None:

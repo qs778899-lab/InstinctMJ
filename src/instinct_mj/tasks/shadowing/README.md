@@ -88,11 +88,18 @@ instinct-play Instinct-Shadowing-WholeBody-Plane-G1-Play-v0 --load-run <run_name
 2. Train the policy:
 ```bash
 instinct-train Instinct-Perceptive-Shadowing-G1-v0
+
+uv run instinct-train Instinct-Perceptive-Shadowing-G1-v0
 ```
 
 3. Play trained policy (`--load-run` is required; absolute path is recommended, or use `--agent random` for an untrained policy):
 ```bash
 instinct-play Instinct-Perceptive-Shadowing-G1-Play-v0 --load-run <run_name>
+
+
+uv run instinct-play Instinct-Perceptive-Shadowing-G1-Play-v0 --load-run "2026-03-17_10-30-00"
+
+
 ```
 
 4. Current maintained setup notes in this workspace (as of `2026-03-09`):

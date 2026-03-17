@@ -1,0 +1,34 @@
+motion_files:
+- motion_file: 20251106_diveroll4_simpleLab_noWall/diveroll4-ziwen-0-retargeted.npz
+  terrain_id: 0
+- motion_file: 20251106_diveroll4_roadRamp_noWall/diveroll4-ziwen-0-retargeted.npz
+  terrain_id: 1
+- motion_file: 50cm_kneeClimbStep/kneelClimbStep1-x-0.1-ziwen-retargeted.npz
+  terrain_id: 2
+- motion_file: 50cm_kneeClimbStep/jumpsit2-ziwen-retargeted.npz
+  terrain_id: 2
+- motion_file: 50cm_kneeClimbStep/rollVault11-ziwen-retargeted.npz
+  terrain_id: 2
+- motion_file: 20251106_diveroll4_simpleLab/diveroll4-ziwen-0-retargeted.npz
+  terrain_id: 3
+- motion_file: 50cm_kneeClimbStep_noWall/kneelClimbStep1-x-0.1-ziwen-retargeted.npz
+  terrain_id: 4
+- motion_file: 50cm_kneeClimbStep_noWall/jumpsit2-ziwen-retargeted.npz
+  terrain_id: 4
+- motion_file: 50cm_kneeClimbStep_noWall/rollVault11-ziwen-retargeted.npz
+  terrain_id: 4
+- motion_file: 20251106_diveroll4_roadRamp/diveroll4-ziwen-0-retargeted.npz
+  terrain_id: 5
+terrains:
+- terrain_file: 20251106_diveroll4_simpleLab_noWall/simplelab_enlarged_noWall.stl
+  terrain_id: 0
+- terrain_file: 20251106_diveroll4_roadRamp_noWall/roadRamp_Vertical_noWall.stl
+  terrain_id: 1
+- terrain_file: 50cm_kneeClimbStep/50cmboxes_19_36_49.stl
+  terrain_id: 2
+- terrain_file: 20251106_diveroll4_simpleLab/simplelab_16_31_36.stl
+  terrain_id: 3
+- terrain_file: 50cm_kneeClimbStep_noWall/50cmboxes_noWall.stl
+  terrain_id: 4
+- terrain_file: 20251106_diveroll4_roadRamp/roadRamp_Vertical_16_33_42.stl
+  terrain_id: 5

@@ -1,0 +1,6 @@
+motion_files:
+- motion_file: diveroll4-ziwen-0-retargeted.npz
+  terrain_id: 0
+terrains:
+- terrain_file: simplelab_16_31_36.stl
+  terrain_id: 0

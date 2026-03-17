@@ -29,7 +29,7 @@ from instinct_mj.motion_reference.utils import motion_interpolate_bilinear
 G1_CFG = G1_29DOF_TORSOBASE_POPSICLE_CFG
 
 # NOTE: Change this to your local perceptive shadowing dataset folder.
-MOTION_FOLDER = "~/Xyk/Datasets/20251116_50cm_kneeClimbStep1"
+MOTION_FOLDER = "/home/huangyucheng/桌面/Project Instinct/InstinctMJ/src/instinct_mj/tasks/20251116_50cm_kneeClimbStep1/20251116_50cm_kneeClimbStep1/50cm_kneeClimbStep_noWall"
 
 
 @dataclass(kw_only=True)
@@ -128,7 +128,7 @@ motion_reference_cfg_play.reference_entity_name = "robot_reference"
 class G1PerceptiveShadowingEnvCfg(perceptual_cfg.PerceptiveShadowingEnvCfg):
     scene: perceptual_cfg.PerceptiveShadowingSceneCfg = field(
         default_factory=lambda: perceptual_cfg.PerceptiveShadowingSceneCfg(
-            num_envs=3072,
+            num_envs=512,
             entities={"robot": deepcopy(G1_CFG)},
             sensors=perceptual_cfg.make_perceptive_scene_sensors(
                 motion_reference=deepcopy(motion_reference_cfg),

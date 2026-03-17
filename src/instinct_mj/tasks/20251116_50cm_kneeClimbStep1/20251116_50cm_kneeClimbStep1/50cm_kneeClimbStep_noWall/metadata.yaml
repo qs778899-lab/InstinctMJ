@@ -1,0 +1,6 @@
+motion_files:
+- motion_file: jumpsit2-ziwen-retargeted.npz
+  terrain_id: 0
+terrains:
+- terrain_file: 50cmboxes_noWall.stl
+  terrain_id: 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -408,6 +409,97 @@ def _run_headless_rollout(
             actions = policy(observations)
             observations, _, _, _ = env.step(actions)
 
+# print order
+def _print_policy_observation_debug(vec_env: InstinctRlVecEnvWrapper, tag: str) -> None:
+    """Print joint ordering and flattened policy observation layout once for debugging."""
+    _, extras = vec_env.get_observations()
+    observations = extras["observations"]
+    policy_obs = observations["policy"]
+    critic_obs = observations.get("critic")
+    obs_format = vec_env.get_obs_format()
+
+    base_env = vec_env.unwrapped
+    robot = base_env.scene["robot"]
+    motion_reference = base_env.scene["motion_reference"]
+
+    robot_joint_names = list(robot.joint_names)
+    reference_joint_names = list(motion_reference.joint_names)
+
+    print(f"\n[DEBUG {tag}] robot joint order ({len(robot_joint_names)}):")
+    for joint_idx, joint_name in enumerate(robot_joint_names):
+        print(f"  {joint_idx:02d}: {joint_name}")
+
+    print(f"\n[DEBUG {tag}] motion-reference joint order ({len(reference_joint_names)}):")
+    for joint_idx, joint_name in enumerate(reference_joint_names):
+        print(f"  {joint_idx:02d}: {joint_name}")
+
+    for group_name, group_format in obs_format.items():
+        print(f"\n[DEBUG {tag}] {group_name} observation term order / flat slices:")
+        offset = 0
+        for term_name, shape in group_format.items():
+            flat_dim = math.prod(shape)
+            print(f"  {term_name:20s} shape={str(shape):>12s} flat=[{offset}:{offset + flat_dim}]")
+            offset += flat_dim
+
+    def _print_joint_term(group_name: str, group_obs: torch.Tensor | None, term_name: str, joint_names: list[str]) -> None:
+        if group_obs is None:
+            return
+        group_format = obs_format.get(group_name)
+        if group_format is None or term_name not in group_format:
+            return
+
+        offset = 0
+        for format_term_name, shape in group_format.items():
+            flat_dim = math.prod(shape)
+            if format_term_name == term_name:
+                term_flat = group_obs[0, offset : offset + flat_dim].detach().cpu()
+                print(f"\n[DEBUG {tag}] {group_name}.{term_name} flat shape = {tuple(term_flat.shape)}")
+                if flat_dim == len(joint_names):
+                    reshaped = term_flat.view(1, len(joint_names))
+                elif flat_dim % len(joint_names) == 0:
+                    reshaped = term_flat.view(flat_dim // len(joint_names), len(joint_names))
+                else:
+                    print(
+                        f"[DEBUG {tag}] {group_name}.{term_name}: flat dim {flat_dim} is not divisible by"
+                        f" num_joints {len(joint_names)}"
+                    )
+                    return
+
+                print(
+                    f"[DEBUG {tag}] {group_name}.{term_name} reshaped as {tuple(reshaped.shape)}, "
+                    "showing last frame:"
+                )
+                for joint_idx, joint_name in enumerate(joint_names):
+                    print(f"  {joint_idx:02d}: {joint_name:30s} {float(reshaped[-1, joint_idx]): .6f}")
+                return
+            offset += flat_dim
+
+    for obs_group_name, group_obs in (("policy", policy_obs), ("critic", critic_obs)):
+        for joint_term_name in ("joint_pos_ref", "joint_vel_ref", "joint_pos", "joint_vel", "last_action"):
+            _print_joint_term(obs_group_name, group_obs, joint_term_name, robot_joint_names)
+
+# print order
+def _print_policy_action_debug(vec_env: InstinctRlVecEnvWrapper, policy, tag: str) -> None:
+    """Print policy action ordering and a sample action vector once for debugging."""
+    obs, _ = vec_env.get_observations()
+    with torch.no_grad():
+        actions = policy(obs)
+
+    robot_joint_names = list(vec_env.unwrapped.scene["robot"].joint_names)
+    action_sample = actions[0].detach().cpu()
+
+    print(f"\n[DEBUG {tag}] policy action shape = {tuple(actions.shape)}")
+    print(f"[DEBUG {tag}] action dimensions map to robot joint order ({len(robot_joint_names)}):")
+
+    if action_sample.numel() != len(robot_joint_names):
+        print(
+            f"[DEBUG {tag}] action dim {action_sample.numel()} does not match robot joint count {len(robot_joint_names)}"
+        )
+        return
+
+    for action_idx, joint_name in enumerate(robot_joint_names):
+        print(f"  {action_idx:02d}: {joint_name:30s} {float(action_sample[action_idx]): .6f}")
+
 
 def run_play(task_id: str, cfg: PlayConfig) -> None:
     if InstinctRlVecEnvWrapper is None:
@@ -489,6 +581,9 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
         critic_group=agent_cfg.critic_observation_group,
     )
 
+    # print order
+    _print_policy_observation_debug(vec_env, tag="InstinctMJ")
+
     viewer_env = _ViewerEnvAdapter(vec_env)
 
     if cfg.agent in {"zero", "random"}:
@@ -545,6 +640,9 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
             if runner is None:
                 raise RuntimeError("Runner is not initialized.")
             policy = runner.get_inference_policy(device=device)
+
+    # print order
+    _print_policy_action_debug(vec_env, policy, tag="InstinctMJ")
 
     rollout_steps = _resolve_rollout_steps(cfg)
 
